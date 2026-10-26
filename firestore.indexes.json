@@ -1,0 +1,91 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "appointments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "patientDocId", "order": "ASCENDING" },
+        { "fieldPath": "slot", "order": "DESCENDING" },
+        { "fieldPath": "__name__", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "appointments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "doctorDocId", "order": "ASCENDING" },
+        { "fieldPath": "slot", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "appointments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "doctorDocId", "order": "ASCENDING" },
+        { "fieldPath": "slotKey", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "appointments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "slotKey", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "appointmentRequests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "requestedAt", "order": "ASCENDING" }
+      ]
+    },
+
+    {
+  "collectionGroup": "labTests",
+  "queryScope": "COLLECTION",
+  "fields": [
+    { "fieldPath": "labId", "order": "ASCENDING" },
+    { "fieldPath": "active", "order": "ASCENDING" },
+    { "fieldPath": "code", "order": "ASCENDING" }
+  ]
+},
+{
+  "collectionGroup": "labOrders",
+  "queryScope": "COLLECTION",
+  "fields": [
+    { "fieldPath": "doctorDocId", "order": "ASCENDING" },
+    { "fieldPath": "orderedAt", "order": "DESCENDING" }
+  ]
+},
+
+{
+  "collectionGroup": "labOrders",
+  "queryScope": "COLLECTION",
+  "fields": [
+    { "fieldPath": "labClinicId", "order": "ASCENDING" },
+    { "fieldPath": "orderedAt", "order": "DESCENDING" }
+  ]
+},
+
+{
+  "collectionGroup": "labOrders",
+  "queryScope": "COLLECTION",
+  "fields": [
+    { "fieldPath": "labClinicId", "order": "ASCENDING" },
+    { "fieldPath": "deptId", "order": "ASCENDING" },
+    { "fieldPath": "orderedAt", "order": "DESCENDING" }
+  ]
+},
+    {
+      "collectionGroup": "appointmentRequests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "patientDocId", "order": "ASCENDING" },
+        { "fieldPath": "requestedAt", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

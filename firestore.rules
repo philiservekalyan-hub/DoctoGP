@@ -1,0 +1,442 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -----------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    function role() {
+      return isSignedIn() ? request.auth.token.role : '';
+    }
+
+    function userData() {
+      return get(/databases/$(database)/documents/users/$(uid())).data;
+    }
+
+    function myClinicId() {
+      return isSignedIn() ? userData().clinicId : null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && role() == 'admin';
+    }
+
+    function isOwner() {
+      return isSignedIn() && role() == 'owner';
+    }
+
+    function isDoctor() {
+      return isSignedIn() && role() == 'doctor';
+    }
+
+    function isReceptionist() {
+      return isSignedIn() && role() == 'receptionist';
+    }
+
+    function isNurse() {
+      return isSignedIn() && role() == 'nurse';
+    }
+
+    function isLab() {
+      return isSignedIn() && role() == 'lab';
+    }
+
+    function isPatient() {
+      return isSignedIn() && role() == 'patient';
+    }
+
+    function isStaff() {
+      return isSignedIn()
+        && role() in ['receptionist','doctor','nurse','lab','admin','owner'];
+    }
+
+    function isClinicAdmin() {
+      return isAdmin() || isOwner();
+    }
+
+    function onlyChanged(keys) {
+      return request.resource.data.diff(resource.data)
+               .affectedKeys().hasOnly(keys);
+    }
+
+    function ownsPatientDoc(patientDocId) {
+      return isSignedIn()
+        && get(/databases/$(database)/documents/patients/$(patientDocId))
+             .data.userId == uid();
+    }
+
+    // =================================================================
+    // USERS
+    // =================================================================
+    match /users/{userId} {
+  allow read: if isSignedIn();
+  // Allow a signed-in user to create their own user doc (signup)
+  allow create: if isSignedIn() && uid() == userId;
+  // Allow updates: self or clinic admin
+  allow update: if isSignedIn() && (uid() == userId || isClinicAdmin());
+  // Deletes only by admin/owner
+  allow delete: if isClinicAdmin();
+}
+
+    // =================================================================
+    // COUNTERS (token + appointment-code)
+    // =================================================================
+    match /counters/{docId} {
+      allow read, write: if isStaff();
+    }
+
+    // =================================================================
+    // PATIENTS
+    // =================================================================
+    match /patients/{patientId} {
+      // Staff see all; patient sees own via userId or email; self-signup.
+      allow read: if isStaff();
+      allow read: if isSignedIn() && resource.data.userId == uid();
+      allow read: if isSignedIn()
+                  && resource.data.email == request.auth.token.email;
+
+      // Staff create; new patient signup creates own.
+      allow create: if isStaff();
+      allow create: if isSignedIn()
+                    && request.resource.data.userId == uid();
+
+      // Patient updates only contact fields on own record.
+      allow update: if isSignedIn()
+        && resource.data.userId == uid()
+        && onlyChanged([
+             'fullName','phone','address','city','updatedAt'
+           ]);
+
+      // Signup-time linking (self-claim by email).
+      allow update: if isSignedIn()
+        && resource.data.email == request.auth.token.email
+        && onlyChanged(['userId','appRegisteredAt']);
+
+      // Staff update anything.
+      allow update: if isStaff();
+
+      allow delete: if isClinicAdmin();
+    }
+
+    // =================================================================
+    // APPOINTMENTS
+    // =================================================================
+    match /appointments/{id} {
+      // Any signed-in user can read — needed for slot/queue views.
+      allow read: if isSignedIn();
+      allow create: if isStaff();
+      allow update: if isSignedIn()
+        && (
+          (ownsPatientDoc(resource.data.patientDocId)
+            && onlyChanged([
+                 'status','confirmedAt','declinedAt','declineReason',
+                 'cancelledAt','cancelledBy','cancelReason'
+               ])
+            && request.resource.data.status in
+                  ['confirmed','declined','cancelled'])
+          || isStaff()
+        );
+      allow delete: if isClinicAdmin();
+    }
+
+    // =================================================================
+    // APPOINTMENT REQUESTS
+    // =================================================================
+    match /appointmentRequests/{id} {
+      allow create: if ownsPatientDoc(
+                           request.resource.data.patientDocId)
+        && request.resource.data.status == 'pending';
+      allow read: if ownsPatientDoc(resource.data.patientDocId)
+                  || isStaff();
+      allow update: if isSignedIn()
+        && (
+          (ownsPatientDoc(resource.data.patientDocId)
+            && onlyChanged([
+                 'status','reviewedAt','reviewedByUid','rejectionReason'
+               ])
+            && request.resource.data.status == 'cancelled')
+          || isStaff()
+        );
+      allow delete: if isClinicAdmin();
+    }
+
+    // =================================================================
+    // PATIENT DOCUMENTS
+    // =================================================================
+    match /patientDocuments/{id} {
+      allow read: if isSignedIn()
+                  && (ownsPatientDoc(resource.data.patientDocId)
+                      || isStaff());
+      allow create: if isSignedIn()
+        && (ownsPatientDoc(request.resource.data.patientDocId)
+            || isStaff());
+      allow update, delete: if isSignedIn()
+        && (ownsPatientDoc(resource.data.patientDocId)
+            || isStaff());
+    }
+
+    // =================================================================
+    // LAB ORDERS
+    // =================================================================
+    match /labOrders/{id} {
+      // Doctor, patient, lab staff, or any clinic staff can read.
+      allow read: if isSignedIn()
+                  && (
+                    ownsPatientDoc(resource.data.patientDocId)
+                    || isStaff()
+                  );
+      // Doctor, receptionist, nurse, or lab can create.
+      allow create: if isSignedIn()
+                    && (isDoctor() || isReceptionist()
+                        || isNurse() || isLab());
+      // Anyone in the flow can update (status, report upload).
+      allow update: if isSignedIn()
+                    && (isDoctor() || isReceptionist() || isNurse()
+                        || isLab() || isClinicAdmin());
+      allow delete: if isClinicAdmin();
+    }
+
+        // =================================================================
+    // CONSULTATIONS  (clinical record — one doc per appointment)
+    // =================================================================
+    match /consultations/{consultationId} {
+      // Read — the doctor who authored it, any clinic staff in the same
+      // clinic, or the patient themselves. This covers:
+      //   • PatientHistoryService._watchConsultationsByIds (doctor)
+      //   • PatientHistoryScreen (doctor)
+      //   • Consult tab (doctor)
+      //   • Patient-side "my consultations" if any.
+      allow read: if isSignedIn()
+        && (
+             resource.data.doctorDocId == uid()
+             || isStaff()
+             || ownsPatientDoc(resource.data.patientDocId)
+           );
+
+      // Create / update — only the doctor on this consultation, only
+      // from their own clinic. Covers upsertDraft, appendLabOrderId,
+      // and completeConsultation.
+      allow create, update: if isSignedIn()
+        && request.resource.data.doctorDocId == uid()
+        && request.resource.data.clinicId == myClinicId();
+
+      // Delete — disabled. Consults are audit records.
+      allow delete: if false;
+    }
+
+    // =================================================================
+    // INVOICES
+    // =================================================================
+    match /invoices/{id} {
+      allow read: if isSignedIn()
+                  && (ownsPatientDoc(resource.data.patientDocId)
+                      || isStaff());
+      allow create, update: if isStaff();
+      allow delete: if isClinicAdmin();
+    }
+
+// =================================================================
+    // VITALS  (nurse-recorded, immutable clinical record)
+    // =================================================================
+    match /vitals/{vitalId} {
+      // Patient can read own; any clinic staff can read.
+      allow read: if isSignedIn()
+                  && (
+                       ownsPatientDoc(resource.data.patientDocId)
+                       || isStaff()
+                     );
+
+      // Only clinical staff can create — nurse, doctor, admin/owner.
+      // (Receptionist excluded: they don't record vitals.)
+      allow create: if isSignedIn()
+        && (isNurse() || isDoctor() || isClinicAdmin())
+        // Recorded-by must match the caller (audit integrity).
+        && request.resource.data.recordedByUid == uid()
+        // Must belong to the caller's clinic.
+        && request.resource.data.clinicId == myClinicId()
+        // Timestamp must be server time (no backdating).
+        && request.resource.data.recordedAt == request.time
+        // Core linkage fields must be present.
+        && request.resource.data.keys().hasAll([
+             'patientDocId','patientId','doctorDocId','doctorName',
+             'clinicId','clinicCode','appointmentDocId',
+             'recordedByUid','recordedByName','recordedAt'
+           ]);
+
+      // Vitals are immutable — corrections go in a separate collection.
+      allow update, delete: if false;
+    }
+    
+
+    // =================================================================
+    // STAFF ATTENDANCE
+    // =================================================================
+    match /staffAttendance/{id} {
+      allow read, write: if isStaff();
+    }
+
+    // =================================================================
+    // CLINICS & LABS (single collection, distinguished by `type`)
+    // =================================================================
+   match /clinics/{clinicId} {
+  allow read: if isSignedIn();
+  allow read: if isSignedIn()
+              && resource.data.ownerEmail == request.auth.token.email;
+
+  allow create: if isAdmin();
+  allow delete: if isAdmin();
+
+  // Receptionist, admin, or owner can edit clinic details.
+  allow update: if isSignedIn()
+    && (isReceptionist() || isClinicAdmin());
+
+  //  NEW — Owner self-claim during signup (no role claim yet).
+  allow update: if isSignedIn()
+    && resource.data.ownerEmail == request.auth.token.email
+    && onlyChanged(['ownerUserId', 'ownerClaimedAt', 'updatedAt']);
+
+  // ----- Subcollection: two-sided links -----
+  match /linkedLabs/{labClinicId} {
+    allow read: if isSignedIn();
+    allow create, update, delete: if isAdmin();
+  }
+
+  match /linkedClinics/{otherClinicId} {
+    allow read: if isSignedIn();
+    allow create, update, delete: if isAdmin();
+  }
+
+  match /labTests/{testId} {
+    allow read: if isSignedIn();
+    allow write: if isSignedIn()
+      && (
+        isAdmin()
+        || isClinicAdmin()
+        || (isLab() && clinicId == myClinicId())
+      );
+  }
+
+  match /catalog/{docId} {
+    allow read: if isSignedIn();
+    allow write: if isSignedIn()
+      && (
+        isAdmin()
+        || (isLab() && clinicId == myClinicId())
+      );
+  }
+
+  match /departments/{deptId} {
+    allow read: if isSignedIn();
+    allow write: if isSignedIn()
+      && (
+        isAdmin()
+        || isClinicAdmin()
+        || (isLab() && clinicId == myClinicId())
+      );
+  }
+}
+
+    // =================================================================
+    // INVITES
+    // =================================================================
+     match /invites/{inviteId} {
+  allow read: if isSignedIn();
+
+  // TEMPORARY DEBUG — allow any signed-in user to write any invite.
+  // Tighten back down after the signup flow works.
+  allow write: if isSignedIn();
+}
+
+
+    // =================================================================
+    // OTP
+    // =================================================================
+    match /otpRateLimits/{id} {
+      allow read, write: if isSignedIn();
+    }
+    match /otpSessions/{id} {
+      allow read, write: if isSignedIn();
+    }
+
+    // =================================================================
+    // AUDIT LOGS
+    // =================================================================
+    match /auditLogs/{id} {
+      allow read: if isSignedIn() && (isStaff() || isClinicAdmin());
+      allow write: if false;
+    }
+
+// =================================================================
+// CANONICAL TEST DICTIONARY
+// =================================================================
+match /tests/{testId} {
+  // Anyone signed in can read — needed by the doctor picker and
+  // the lab offering UI.
+  allow read: if isSignedIn();
+
+  // Only platform admins can create canonical tests. The rule
+  // enforces the shape: fixed enum values, valid code format,
+  // and every required field present.
+  allow create: if isAdmin()
+    && request.resource.data.keys().hasAll([
+         'code', 'name', 'codeLower', 'nameLower',
+         'category', 'sampleType', 'fastingRequired',
+         'active', 'createdByUid'
+       ])
+    && request.resource.data.code is string
+    && request.resource.data.code.matches('^[A-Z0-9_]{2,12}$')
+    && request.resource.data.name is string
+    && request.resource.data.name.size() >= 3
+    && request.resource.data.name.size() <= 80
+    && request.resource.data.codeLower ==
+         request.resource.data.code.lower()
+    && request.resource.data.nameLower ==
+         request.resource.data.name.lower()
+    && request.resource.data.category in [
+         'haematology', 'biochemistry', 'clinicalPathology',
+         'serology', 'immunology', 'microbiology',
+         'endocrinology', 'tumourMarkers', 'cytology',
+         'histopathology', 'molecular', 'other'
+       ]
+    && request.resource.data.sampleType in [
+         'blood', 'serum', 'plasma', 'urine', 'stool',
+         'sputum', 'swab', 'csf', 'tissue', 'other'
+       ];
+
+  // Updates can change name, category, sampleType, fastingRequired,
+  // active, and the optional descriptive fields — but NOT code.
+  // Code is immutable once a test exists.
+  allow update: if isAdmin()
+    && request.resource.data.code == resource.data.code
+    && request.resource.data.category in [
+         'haematology', 'biochemistry', 'clinicalPathology',
+         'serology', 'immunology', 'microbiology',
+         'endocrinology', 'tumourMarkers', 'cytology',
+         'histopathology', 'molecular', 'other'
+       ]
+    && request.resource.data.sampleType in [
+         'blood', 'serum', 'plasma', 'urine', 'stool',
+         'sputum', 'swab', 'csf', 'tissue', 'other'
+       ];
+
+  // Never hard-delete — soft-delete via active: false.
+  allow delete: if false;
+}
+
+    // =================================================================
+    // Fallback
+    // =================================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

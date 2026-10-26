@@ -1,0 +1,13 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  errors:
+    # TEMPORARY — silenced for Phase 1 launch.
+    # TODO (Phase 2): remove this, migrate withOpacity → withValues
+    # across the codebase, then let the warnings surface again.
+    deprecated_member_use: ignore
+  exclude:
+    - build/**
+    - android/**
+    - web/**
+    - windows/**

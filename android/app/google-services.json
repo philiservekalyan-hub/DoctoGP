@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "205040481875",
+    "project_id": "doctogp-40a97",
+    "storage_bucket": "doctogp-40a97.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:205040481875:android:f1f5b30303742f5c82f8a6",
+        "android_client_info": {
+          "package_name": "com.example.doctogp"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "205040481875-6h4iesqo3fc02v732obkkf8cvfgoc2sn.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA-n4Eds08aEU7MtbFwa-bGuZHma1QlGlA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "205040481875-6h4iesqo3fc02v732obkkf8cvfgoc2sn.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
