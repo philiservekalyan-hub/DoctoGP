@@ -11,7 +11,7 @@ class GpClinicApp extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final router = ref.watch(routerProvider);
     return MaterialApp.router(
-      title: 'GP Clinic',
+      title: 'STAT',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.dark,
       routerConfig: router,

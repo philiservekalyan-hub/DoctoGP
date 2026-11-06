@@ -14,6 +14,7 @@ import '../../../core/models/lab_order_model.dart';
 import '../../../core/providers/service_providers.dart';
 import '../../../core/widgets/glass_card.dart';
 import '../../../core/widgets/section_header.dart';
+import 'sample_label_preview.dart';
 
 class LabOrderDetailScreen extends ConsumerStatefulWidget {
   final LabOrderModel order;
@@ -64,8 +65,6 @@ class _LabOrderDetailScreenState
       final url =
           await FirebaseStorage.instance.ref(path).getDownloadURL();
 
-      // attachReport sets status to 'ready' and records all report fields
-      // in one update — no separate updateStatus call needed.
       await ref.read(labServiceProvider).attachReport(
             orderId: _order.docId,
             reportUrl: url,
@@ -90,6 +89,24 @@ class _LabOrderDetailScreenState
     } finally {
       if (mounted) setState(() => _uploading = false);
     }
+  }
+
+  Future<void> _reprintLabels() async {
+    if (_order.sampleGroups.isEmpty) return;
+    await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (_) => SampleLabelsPreviewSheet(
+        order: _order,
+        groups: _order.sampleGroups,
+        collectedAt: _order.sampleCollectedAt ?? DateTime.now(),
+      ),
+    );
   }
 
   String _contentType(String name) {
@@ -176,6 +193,71 @@ class _LabOrderDetailScreenState
                 }).toList(),
               ),
             ),
+
+            if (_order.sampleGroups.isNotEmpty) ...[
+              const SizedBox(height: 20),
+              const SectionHeader(title: 'Sample labels'),
+              const SizedBox(height: 8),
+              GlassCard(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(children: [
+                      const Icon(Icons.qr_code_2_rounded,
+                          color: AppColors.labAccent),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          '${_order.sampleGroups.length} label${_order.sampleGroups.length == 1 ? '' : 's'} generated',
+                          style: AppTextStyles.body,
+                        ),
+                      ),
+                    ]),
+                    const SizedBox(height: 10),
+                    ..._order.sampleGroups.map((g) => Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 3),
+                          child: Row(children: [
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 6, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: AppColors.info.withOpacity(.13),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(
+                                g.sampleType.toUpperCase(),
+                                style: AppTextStyles.caption.copyWith(
+                                    color: AppColors.info,
+                                    fontSize: 10),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                g.sampleIds.join(', '),
+                                style: AppTextStyles.caption,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ]),
+                        )),
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: _reprintLabels,
+                        icon: const Icon(Icons.print_rounded, size: 18),
+                        label: const Text('Reprint labels'),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: AppColors.labAccent,
+                          side: const BorderSide(color: AppColors.labAccent),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
 
             if (_order.instructions != null &&
                 _order.instructions!.isNotEmpty) ...[

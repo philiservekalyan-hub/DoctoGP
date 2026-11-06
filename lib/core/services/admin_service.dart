@@ -1,3 +1,4 @@
+// lib/core/services/admin_service.dart
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -32,16 +33,50 @@ class AdminService {
     return ref.id;
   }
 
-  /// Attaches a clinic to an existing user by their auth UID.
+  /// Attaches a clinic or lab to a user's account.
+  ///
+  /// Sets the user's clinic linkage, role, orgType, and the two
+  /// capability flags (`isDoctor` and `isLabOwner`).
+  ///
+  /// [role] is the primary role for routing — `'owner'` when the
+  /// admin is linking the owner, or `'lab'`/`'receptionist'` when
+  /// the admin is linking a staff member later.
+  ///
+  /// [orgType] must be `'clinic'` or `'lab'`. It distinguishes clinic
+  /// from lab and is used by the router's fast path.
+  ///
+  /// [isDoctor] / [isLabOwner] are inferred when not passed:
+  ///   • An owner of a clinic becomes `isDoctor: true` by default
+  ///     (most GPs own their practice).
+  ///   • An owner of a lab becomes `isLabOwner: true`.
+  ///   • Staff linking leaves both flags at their defaults (false).
   Future<void> attachClinicToUser({
     required String userId,
     required String clinicId,
     required String role,
+    required String orgType,
+    bool? isDoctor,
+    bool? isLabOwner,
   }) async {
+    final org = await _db.collection('clinics').doc(clinicId).get();
+    final m = org.data() ?? {};
+
+    final isLab = orgType == 'lab';
+    final effectiveIsDoctor =
+        isDoctor ?? (role == 'owner' && !isLab);
+    final effectiveIsLabOwner =
+        isLabOwner ?? (isLab && role == 'owner');
+
     await _db.collection('users').doc(userId).update({
       'clinicId': clinicId,
+      'clinicCode': (m['clinicCode'] ?? '').toString(),
+      'clinicName': (m['name'] ?? '').toString(),
       'role': role,
+      'orgType': orgType,
+      'isDoctor': effectiveIsDoctor,
+      'isLabOwner': effectiveIsLabOwner,
       'active': true,
+      'updatedAt': FieldValue.serverTimestamp(),
     });
   }
 

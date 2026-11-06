@@ -36,13 +36,14 @@ final appointmentRequestServiceProvider =
 final patientRequestsProvider =
     StreamProvider.autoDispose<List<AppointmentRequestModel>>((ref) {
   final patient = ref.watch(currentPatientProvider).valueOrNull;
-  if (patient == null) return const Stream.empty();
+  if (patient == null || patient['isLabCustomer'] == true) {
+    return const Stream.empty();
+  }
   return ref
       .read(appointmentRequestServiceProvider)
       .watchPatientRequests(patient['patientDocId'] as String);
 });
 
-/// Live queue for a specific doctor (today only).
 final doctorQueueProvider =
     StreamProvider.autoDispose.family<List<AppointmentModel>, String>(
         (ref, doctorDocId) {
@@ -74,7 +75,6 @@ final doctorQueueProvider =
   });
 });
 
-/// Streams all live appointments in the same (doctor, day, period) slot.
 final slotQueueProvider =
     StreamProvider.autoDispose.family<List<AppointmentModel>, String>(
         (ref, compositeKey) {
@@ -87,32 +87,122 @@ final slotQueueProvider =
       .watchSlotQueue(doctorDocId: doctorDocId, slotKey: slotKey);
 });
 
-/// The patient's lab orders (all statuses).
 final patientLabOrdersProvider =
     StreamProvider.autoDispose<List<LabOrderModel>>((ref) {
-  final patient = ref.watch(currentPatientProvider).valueOrNull;
-  if (patient == null) return const Stream.empty();
-  return ref
-      .read(labServiceProvider)
-      .watchPatientOrders(patient['patientDocId'] as String);
+  final userAsync = ref.watch(currentUserProvider);
+
+  return userAsync.when(
+    loading: () => const Stream.empty(),
+    error: (_, __) => const Stream.empty(),
+    data: (user) {
+      if (user == null) return const Stream.empty();
+      final db = FirebaseFirestore.instance;
+
+      return db
+          .collection('users')
+          .doc(user.uid)
+          .snapshots()
+          .asyncExpand((userSnap) {
+        final data = userSnap.data() ?? {};
+        final linkedPatientDocId =
+            (data['linkedPatientDocId'] ?? '').toString();
+        final linkedDisplayPatientId =
+            (data['linkedDisplayPatientId'] ?? '').toString();
+        final labClinicId = (data['clinicId'] ?? '').toString();
+
+        if (linkedPatientDocId.isNotEmpty) {
+          return db
+              .collection('labOrders')
+              .where('patientDocId', isEqualTo: linkedPatientDocId)
+              .snapshots()
+              .map(_toSortedOrders);
+        }
+
+        if (linkedDisplayPatientId.isNotEmpty && labClinicId.isNotEmpty) {
+          return db
+              .collection('labOrders')
+              .where('labClinicId', isEqualTo: labClinicId)
+              .where('patientId', isEqualTo: linkedDisplayPatientId)
+              .where('released', isEqualTo: true)
+              .snapshots()
+              .map(_toSortedOrders);
+        }
+
+        return const Stream.empty();
+      });
+    },
+  );
 });
 
-/// Resolves the patient record using the stable Firebase Auth UID first,
-/// then a normalized email lookup as a compatibility fallback.
+List<LabOrderModel> _toSortedOrders(
+    QuerySnapshot<Map<String, dynamic>> snap) {
+  final list = snap.docs
+      .map((d) => LabOrderModel.fromMap(d.id, d.data()))
+      .toList();
+  list.sort((a, b) => (b.orderedAt ?? DateTime(2000))
+      .compareTo(a.orderedAt ?? DateTime(2000)));
+  return list;
+}
+
+// -----------------------------------------------------------------
+// Resolves the current patient record.
+//
+// Priority:
+//   1. Clinic patient (users.linkedPatientDocId) — preferred
+//   2. Lab customer (users.linkedLabCustomerDocId) — fallback
+//   3. patients by userId / docId / email — last resort
+// -----------------------------------------------------------------
 final currentPatientProvider =
     FutureProvider.autoDispose<Map<String, dynamic>?>((ref) async {
   final user = await ref.watch(currentUserProvider.future);
   if (user == null) return null;
-
+debugPrint('currentPatientProvider uid=${user.uid} email=${user.email}'); 
   final db = FirebaseFirestore.instance;
+  final userDoc = await db.collection('users').doc(user.uid).get();
+  final userData = userDoc.data() ?? {};
+
+  // 1. Clinic patient record — preferred whenever present.
+  final linkedPatientDocId = (userData['linkedPatientDocId'] ?? '')
+    .toString()
+    .replaceAll('"', '')
+    .replaceAll(RegExp(r'\s'), '')   // strips trailing/NBSP/tab/CR/LF
+    .trim();
+if (linkedPatientDocId.isNotEmpty) {
+  final p = await db.collection('patients').doc(linkedPatientDocId).get();
+  debugPrint('currentPatientProvider: linkedPatientDocId=[$linkedPatientDocId] '
+             'len=${linkedPatientDocId.length} exists=${p.exists}');
+  if (p.exists) return _patientMap(p, user.uid);
+  debugPrint('WARN: linkedPatientDocId set but patients doc missing — '
+             'falling through to lab-customer path');
+}
+
+  // 2. Lab customer record — lab-only customer path.
+  final linkedLabCustomerDocId =
+      (userData['linkedLabCustomerDocId'] ?? '').toString();
+  if (linkedLabCustomerDocId.isNotEmpty) {
+    final c = await db
+        .collection('labCustomers')
+        .doc(linkedLabCustomerDocId)
+        .get();
+    if (c.exists) return _labCustomerMap(c, user.uid);
+
+    final fallback = await db
+        .collection('labCustomers')
+        .where('linkedUserUid', isEqualTo: user.uid)
+        .limit(1)
+        .get();
+    if (fallback.docs.isNotEmpty) {
+      return _labCustomerMap(fallback.docs.first, user.uid);
+    }
+  }
+
+  // 3. Fallback queries on `patients`.
   final byUid = await db
       .collection('patients')
       .where('userId', isEqualTo: user.uid)
       .limit(1)
       .get();
-  if (byUid.docs.isNotEmpty) {
-    return _patientMap(byUid.docs.first, user.uid);
-  }
+  if (byUid.docs.isNotEmpty) return _patientMap(byUid.docs.first, user.uid);
 
   final byDocId = await db.collection('patients').doc(user.uid).get();
   if (byDocId.exists) return _patientMap(byDocId, user.uid);
@@ -128,6 +218,7 @@ final currentPatientProvider =
       return _patientMap(byEmail.docs.first, user.uid);
     }
   }
+
   return null;
 });
 
@@ -138,23 +229,42 @@ Map<String, dynamic> _patientMap(
     'patientDocId': doc.id,
     'authUid': authUid,
     'patientId': doc.data()?['patientId'] ?? doc.id,
+    'isLabCustomer': false,
+  };
+}
+
+Map<String, dynamic> _labCustomerMap(
+    DocumentSnapshot<Map<String, dynamic>> doc, String authUid) {
+  final d = doc.data() ?? {};
+  return <String, dynamic>{
+    ...d,
+    'patientDocId': doc.id,
+    'authUid': authUid,
+    'patientId': d['displayPatientId'] ?? doc.id,
+    'fullName': d['fullName'] ?? '',
+    'phone': d['phone'] ?? '',
+    'email': d['email'] ?? '',
+    'isLabCustomer': true,
   };
 }
 
 final patientAppointmentsProvider =
     StreamProvider.autoDispose<List<AppointmentModel>>((ref) {
   final patient = ref.watch(currentPatientProvider).valueOrNull;
-  if (patient == null) return const Stream.empty();
+  if (patient == null || patient['isLabCustomer'] == true) {
+    return const Stream.empty();
+  }
   return ref
       .read(appointmentServiceProvider)
       .watchPatientAppointments(patient['patientDocId'] as String);
 });
 
-final patientDocumentsProvider =
-    StreamProvider.autoDispose<List<QueryDocumentSnapshot<Map<String, dynamic>>>>(
-        (ref) {
+final patientDocumentsProvider = StreamProvider.autoDispose<
+    List<QueryDocumentSnapshot<Map<String, dynamic>>>>((ref) {
   final patient = ref.watch(currentPatientProvider).valueOrNull;
-  if (patient == null) return const Stream.empty();
+  if (patient == null || patient['isLabCustomer'] == true) {
+    return const Stream.empty();
+  }
   return FirebaseFirestore.instance
       .collection('patientDocuments')
       .where('patientDocId', isEqualTo: patient['patientDocId'])
@@ -164,11 +274,12 @@ final patientDocumentsProvider =
             .compareTo(_asDate(a.data()['createdAt']))));
 });
 
-final patientInvoicesProvider =
-    StreamProvider.autoDispose<List<QueryDocumentSnapshot<Map<String, dynamic>>>>(
-        (ref) {
+final patientInvoicesProvider = StreamProvider.autoDispose<
+    List<QueryDocumentSnapshot<Map<String, dynamic>>>>((ref) {
   final patient = ref.watch(currentPatientProvider).valueOrNull;
-  if (patient == null) return const Stream.empty();
+  if (patient == null || patient['isLabCustomer'] == true) {
+    return const Stream.empty();
+  }
   return FirebaseFirestore.instance
       .collection('invoices')
       .where('patientDocId', isEqualTo: patient['patientDocId'])
@@ -239,7 +350,6 @@ Color _labStatusColor(LabOrderStatus s) {
 // -----------------------------------------------------------------
 // Dashboard
 // -----------------------------------------------------------------
-
 class PatientDashboard extends ConsumerStatefulWidget {
   const PatientDashboard({super.key});
 
@@ -248,10 +358,10 @@ class PatientDashboard extends ConsumerStatefulWidget {
 }
 
 class _PatientDashboardState extends ConsumerState<PatientDashboard> {
-  int _tab = 0;
-  LabOrderStatus? _labFilter; // null = All
+  String _selectedTabLabel = 'Overview';
+  LabOrderStatus? _labFilter;
 
-  static const _tabs = <({String label, IconData icon})>[
+  static const _fullTabs = <({String label, IconData icon})>[
     (label: 'Overview', icon: Icons.dashboard_rounded),
     (label: 'Appointments', icon: Icons.event_available_rounded),
     (label: 'Queue', icon: Icons.people_alt_rounded),
@@ -261,6 +371,19 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
     (label: 'Billing', icon: Icons.receipt_long_rounded),
     (label: 'Profile', icon: Icons.person_rounded),
   ];
+
+  static const _labOnlyTabs = <({String label, IconData icon})>[
+    (label: 'Overview', icon: Icons.dashboard_rounded),
+    (label: 'Lab reports', icon: Icons.science_rounded),
+    (label: 'Profile', icon: Icons.person_rounded),
+  ];
+
+  bool _isLabOnly(Map<String, dynamic> patient) =>
+      patient['isLabCustomer'] == true;
+
+  List<({String label, IconData icon})> _tabsFor(
+          Map<String, dynamic> patient) =>
+      _isLabOnly(patient) ? _labOnlyTabs : _fullTabs;
 
   @override
   Widget build(BuildContext context) {
@@ -285,12 +408,18 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
               data: (patient) {
                 if (patient == null) {
                   return _errorState(
-                    'We could not find a patient profile linked to this account. '
-                    'Ask the clinic to link your account using your Firebase Auth UID.',
+                    'We could not find a patient profile or lab record linked '
+                    'to this account. Ask your clinic or lab to add you.',
                   );
                 }
                 final name =
                     (patient['fullName'] ?? user.name ?? 'Patient').toString();
+                final tabs = _tabsFor(patient);
+                final currentLabel =
+                    tabs.any((t) => t.label == _selectedTabLabel)
+                        ? _selectedTabLabel
+                        : 'Overview';
+
                 return RefreshIndicator(
                   color: AppColors.primary,
                   onRefresh: () async {
@@ -317,18 +446,19 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
                                     '',
                               ),
                               const SizedBox(height: 22),
-                              _navigation(),
+                              _navigation(tabs, currentLabel),
                               const SizedBox(height: 22),
-                              switch (_tab) {
-                                0 => _overview(patient, name, apptAsync),
-                                1 => _appointments(apptAsync,
+                              switch (currentLabel) {
+                                'Appointments' => _appointments(apptAsync,
                                     patient: patient),
-                                2 => _queue(apptAsync),
-                                3 => _labReports(),
-                                4 => _medicalRecords(patient),
-                                5 => _documents(patient),
-                                6 => _billing(),
-                                _ => _profile(patient),
+                                'Queue' => _queue(apptAsync),
+                                'Lab reports' => _labReports(),
+                                'Medical records' =>
+                                  _medicalRecords(patient),
+                                'Documents' => _documents(patient),
+                                'Billing' => _billing(),
+                                'Profile' => _profile(patient),
+                                _ => _overview(patient, name, apptAsync),
                               },
                             ],
                           ),
@@ -382,7 +512,7 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
         Expanded(
           child:
               Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('DoctoGP', style: AppTextStyles.h3),
+            Text('STAT', style: AppTextStyles.h3),
             Text('Patient portal', style: AppTextStyles.caption),
           ]),
         ),
@@ -444,20 +574,19 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
     }
   }
 
-  // -----------------------------------------------------------------
-  // Navigation — Wrap so the 8 chips break into 2+ rows on phones
-  // -----------------------------------------------------------------
-  Widget _navigation() => Wrap(
+  Widget _navigation(
+          List<({String label, IconData icon})> tabs, String current) =>
+      Wrap(
         spacing: 8,
         runSpacing: 8,
-        children: List.generate(_tabs.length, (i) {
-          final selected = i == _tab;
+        children: tabs.map((t) {
+          final selected = t.label == current;
           return ChoiceChip(
             selected: selected,
-            avatar: Icon(_tabs[i].icon,
+            avatar: Icon(t.icon,
                 size: 17,
                 color: selected ? Colors.white : AppColors.textMuted),
-            label: Text(_tabs[i].label),
+            label: Text(t.label),
             labelStyle: TextStyle(
               color: selected ? Colors.white : AppColors.textSecondary,
               fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
@@ -466,16 +595,20 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
             backgroundColor: AppColors.surface,
             side: BorderSide(
                 color: selected ? AppColors.primary : AppColors.cardBorder),
-            onSelected: (_) => setState(() => _tab = i),
+            onSelected: (_) => setState(() => _selectedTabLabel = t.label),
           );
-        }),
+        }).toList(),
       );
 
   // -----------------------------------------------------------------
-  // Overview tab
+  // Overview
   // -----------------------------------------------------------------
   Widget _overview(Map<String, dynamic> patient, String name,
       AsyncValue<List<AppointmentModel>> apptAsync) {
+    if (_isLabOnly(patient)) {
+      return _labOnlyOverview(patient, name);
+    }
+
     final upcoming = apptAsync.valueOrNull == null
         ? null
         : _nextUpcoming(apptAsync.valueOrNull!);
@@ -542,14 +675,13 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
                 accent: AppColors.error)),
       ]),
 
-      // Lab report ready banner
       if (readyCount > 0) ...[
         const SizedBox(height: 14),
         GlassCard(
           borderColor: AppColors.success.withOpacity(.5),
           child: InkWell(
             borderRadius: BorderRadius.circular(14),
-            onTap: () => setState(() => _tab = 3),
+            onTap: () => setState(() => _selectedTabLabel = 'Lab reports'),
             child: Padding(
               padding: const EdgeInsets.all(4),
               child: Row(children: [
@@ -621,8 +753,49 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
     ]);
   }
 
+  Widget _labOnlyOverview(Map<String, dynamic> patient, String name) {
+    final labOrders = ref.watch(patientLabOrdersProvider).valueOrNull ??
+        const <LabOrderModel>[];
+    final readyCount =
+        labOrders.where((o) => o.status == LabOrderStatus.ready).length;
+
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text('Welcome,', style: AppTextStyles.bodyMuted),
+      const SizedBox(height: 4),
+      Text(name, style: AppTextStyles.h1),
+      const SizedBox(height: 6),
+      Text('Your lab reports appear here.',
+          style: AppTextStyles.bodyMuted),
+      const SizedBox(height: 20),
+      _heroCard(),
+      const SizedBox(height: 22),
+      Row(children: [
+        Expanded(
+            child: StatCard(
+                label: 'Lab reports',
+                value: labOrders.length.toString(),
+                icon: Icons.science_rounded,
+                accent: AppColors.info)),
+        const SizedBox(width: 10),
+        Expanded(
+            child: StatCard(
+                label: 'Ready',
+                value: readyCount.toString(),
+                icon: Icons.description_rounded,
+                accent: AppColors.success)),
+      ]),
+      const SizedBox(height: 24),
+      _infoBanner(
+        'Have you visited a clinic? Once your clinic adds your medical '
+        'history, appointments, and prescriptions will appear here too.',
+        AppColors.info,
+        Icons.info_outline_rounded,
+      ),
+    ]);
+  }
+
   // -----------------------------------------------------------------
-  // Book appointment card
+  // Book appointment
   // -----------------------------------------------------------------
   Widget _bookAppointmentCard(Map<String, dynamic> patient) {
     final reqAsync = ref.watch(patientRequestsProvider);
@@ -658,8 +831,7 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
             error: (_, __) => const SizedBox.shrink(),
             data: (reqs) {
               final open = reqs
-                  .where((r) =>
-                      r.status == AppointmentRequestStatus.pending)
+                  .where((r) => r.status == AppointmentRequestStatus.pending)
                   .toList();
               if (open.isEmpty) return const SizedBox.shrink();
               return Column(
@@ -695,8 +867,7 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
                     overflow: TextOverflow.ellipsis,
                     style: AppTextStyles.body),
                 const SizedBox(height: 2),
-                Text(
-                    'Requested ${_dateLabel(r.requestedAt ?? DateTime.now())}',
+                Text('Requested ${_dateLabel(r.requestedAt ?? DateTime.now())}',
                     style: AppTextStyles.caption),
               ],
             ),
@@ -751,8 +922,7 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
                   runSpacing: 8,
                   children: ['any', 'morning', 'afternoon', 'evening']
                       .map((v) => ChoiceChip(
-                            label:
-                                Text(v[0].toUpperCase() + v.substring(1)),
+                            label: Text(v[0].toUpperCase() + v.substring(1)),
                             selected: timeOfDay == v,
                             onSelected: (_) =>
                                 setSheetState(() => timeOfDay = v),
@@ -763,14 +933,12 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
                 Row(children: [
                   Expanded(
                       child: OutlinedButton(
-                          onPressed: () =>
-                              Navigator.pop(sheetContext, false),
+                          onPressed: () => Navigator.pop(sheetContext, false),
                           child: const Text('Cancel'))),
                   const SizedBox(width: 10),
                   Expanded(
                       child: ElevatedButton(
-                          onPressed: () =>
-                              Navigator.pop(sheetContext, true),
+                          onPressed: () => Navigator.pop(sheetContext, true),
                           child: const Text('Send request'))),
                 ]),
               ],
@@ -1065,8 +1233,7 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
                 AppColors.info, Icons.hourglass_top_rounded),
             error: (_, __) => const SizedBox.shrink(),
             data: (queue) {
-              final idx =
-                  queue.indexWhere((q) => q.docId == appt.docId);
+              final idx = queue.indexWhere((q) => q.docId == appt.docId);
               if (idx < 0) {
                 return _infoBanner(
                     appt.status == AppointmentStatus.inConsult
@@ -1099,9 +1266,6 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
     );
   }
 
-  // -----------------------------------------------------------------
-  // Slot status card (rich view for confirmed/active visits)
-  // -----------------------------------------------------------------
   Widget _slotStatusCard(AppointmentModel appt, Map<String, dynamic> patient) {
     if (appt.slotKey == null || appt.doctorDocId.isEmpty) {
       return _appointmentCard(appt, compact: true, patient: patient);
@@ -1436,7 +1600,7 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
   }
 
   // -----------------------------------------------------------------
-  // Lab Reports tab
+  // Lab reports
   // -----------------------------------------------------------------
   Widget _labReports() {
     final async = ref.watch(patientLabOrdersProvider);
@@ -1449,8 +1613,6 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
         Text('Track the tests your doctor ordered and download reports.',
             style: AppTextStyles.bodyMuted),
         const SizedBox(height: 16),
-
-        // Status filter chips
         SingleChildScrollView(
           scrollDirection: Axis.horizontal,
           child: Row(children: [
@@ -1465,9 +1627,7 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
             _statusFilterChip(LabOrderStatus.delivered, 'Delivered'),
           ]),
         ),
-
         const SizedBox(height: 16),
-
         async.when(
           loading: () => const Center(
               child: Padding(
@@ -1484,12 +1644,11 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
                 Icons.science_outlined,
                 orders.isEmpty ? 'No lab reports yet' : 'Nothing here',
                 orders.isEmpty
-                    ? 'When your doctor orders a lab test, its status will appear here.'
+                    ? 'When your doctor orders a lab test, or your lab shares a report with your email or phone, it will appear here.'
                     : 'No lab orders match the selected filter.',
               );
             }
 
-            // Group: ready first, then in-progress, then delivered/closed
             filtered.sort((a, b) {
               int rank(LabOrderModel o) => switch (o.status) {
                     LabOrderStatus.ready => 0,
@@ -1580,16 +1739,16 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
                       Text(testsSummary,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: AppTextStyles.body.copyWith(
-                              fontWeight: FontWeight.w600)),
+                          style: AppTextStyles.body
+                              .copyWith(fontWeight: FontWeight.w600)),
                       const SizedBox(height: 3),
                       Text(o.labName, style: AppTextStyles.caption),
                     ],
                   ),
                 ),
                 Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 9, vertical: 5),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
                   decoration: BoxDecoration(
                     color: color.withOpacity(.13),
                     borderRadius: BorderRadius.circular(8),
@@ -1802,6 +1961,9 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
     }
   }
 
+  // -----------------------------------------------------------------
+  // Medical records
+  // -----------------------------------------------------------------
   Widget _medicalRecords(Map<String, dynamic> patient) {
     final medications = _asStringList(patient['currentMedications']);
     final allergies = _asStringList(patient['allergies']);
@@ -1921,6 +2083,9 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
         ]),
       );
 
+  // -----------------------------------------------------------------
+  // Documents
+  // -----------------------------------------------------------------
   Widget _documents(Map<String, dynamic> patient) {
     final async = ref.watch(patientDocumentsProvider);
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1956,7 +2121,8 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
           return Column(
               children: docs.map((doc) {
             final d = doc.data();
-            final title = (d['title'] ?? d['fileName'] ?? 'Document').toString();
+            final title =
+                (d['title'] ?? d['fileName'] ?? 'Document').toString();
             final category = (d['category'] ?? 'Other').toString();
             return Padding(
                 padding: const EdgeInsets.only(bottom: 10),
@@ -2148,6 +2314,9 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
     await _openDocument(data);
   }
 
+  // -----------------------------------------------------------------
+  // Billing
+  // -----------------------------------------------------------------
   Widget _billing() {
     final async = ref.watch(patientInvoicesProvider);
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -2260,6 +2429,9 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
     ]);
   }
 
+  // -----------------------------------------------------------------
+  // Profile
+  // -----------------------------------------------------------------
   Widget _profile(Map<String, dynamic> patient) =>
       Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Text('My profile', style: AppTextStyles.h1),
@@ -2290,12 +2462,13 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
           _profileRow(
               Icons.person_outline_rounded, 'Gender', patient['gender']),
           const SizedBox(height: 14),
-          SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                  onPressed: () => _editProfile(patient),
-                  icon: const Icon(Icons.edit_rounded),
-                  label: const Text('Edit contact details'))),
+          if (patient['isLabCustomer'] != true)
+            SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                    onPressed: () => _editProfile(patient),
+                    icon: const Icon(Icons.edit_rounded),
+                    label: const Text('Edit contact details'))),
         ])),
         const SizedBox(height: 14),
         _infoBanner(
@@ -2538,8 +2711,6 @@ class _LabReportDetailSheet extends StatelessWidget {
             const SizedBox(height: 4),
             Text(order.labName, style: AppTextStyles.bodyMuted),
             const SizedBox(height: 14),
-
-            // Status chip
             Row(children: [
               Container(
                 padding:
@@ -2553,7 +2724,6 @@ class _LabReportDetailSheet extends StatelessWidget {
                         .copyWith(color: _labStatusColor(order.status))),
               ),
             ]),
-
             const SizedBox(height: 14),
             Text('Tests', style: AppTextStyles.caption),
             const SizedBox(height: 6),
@@ -2563,12 +2733,9 @@ class _LabReportDetailSheet extends StatelessWidget {
                     const Icon(Icons.science_outlined,
                         color: AppColors.info, size: 16),
                     const SizedBox(width: 10),
-                    Expanded(
-                        child:
-                            Text(t.label, style: AppTextStyles.body)),
+                    Expanded(child: Text(t.label, style: AppTextStyles.body)),
                   ]),
                 )),
-
             if (order.instructions != null &&
                 order.instructions!.isNotEmpty) ...[
               const SizedBox(height: 14),
@@ -2576,7 +2743,6 @@ class _LabReportDetailSheet extends StatelessWidget {
               const SizedBox(height: 4),
               Text(order.instructions!, style: AppTextStyles.bodyMuted),
             ],
-
             const SizedBox(height: 16),
             Text('Timeline', style: AppTextStyles.caption),
             const SizedBox(height: 6),
@@ -2590,7 +2756,6 @@ class _LabReportDetailSheet extends StatelessWidget {
               _timelineRow('Cancelled', order.cancelledAt),
             if (order.noShowAt != null)
               _timelineRow('No-show', order.noShowAt),
-
             if (order.reportUrl != null &&
                 order.reportUrl!.isNotEmpty) ...[
               const SizedBox(height: 18),
@@ -2612,7 +2777,6 @@ class _LabReportDetailSheet extends StatelessWidget {
                 ),
               ),
             ],
-
             const SizedBox(height: 16),
           ],
         ),

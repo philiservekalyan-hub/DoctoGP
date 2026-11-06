@@ -2,6 +2,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../models/appointment_model.dart';
+import '../../app/router.dart';
 
 /// Fixed capacity per slot period.
 const int kSlotsPerPeriod = 12;
@@ -159,28 +160,50 @@ class DashboardService {
     });
   }
 
-  Stream<List<Map<String, dynamic>>> searchPatients(String query) {
-    final q = query.trim().toLowerCase();
-    if (q.isEmpty) return const Stream.empty();
+  /// Scoped patient search — filters within the current clinic's
+  /// patients only. Firestore rules evaluate the list against
+  /// `resource.data.clinicId == myClinicId()`, so the query MUST be
+  /// scoped by `clinicId` or the list is denied.
+  ///
+  /// The stream is scoped by `clinicId`, then filtered client-side
+  /// on name / phone / patientId. That's cheap because a clinic's
+  /// patient set is bounded (typically < 5,000 docs).
+  ///
+  /// If a single clinic ever exceeds ~5,000 patients, migrate to
+  /// per-field Firestore prefix queries (name, phone, patientId)
+  /// merged client-side — but that requires composite indexes on
+  /// `(clinicId, fullName)` and `(clinicId, phone)`.
+  Stream<List<Map<String, dynamic>>> searchPatients({
+    required String clinicId,
+    required String query,
+  }) {
+    final q = query.trim();
+    if (q.isEmpty || clinicId.isEmpty) return const Stream.empty();
 
-    return _db.collection('patients').snapshots().map((s) {
-      final list = s.docs
-          .map((d) => <String, dynamic>{'uid': d.id, ...d.data()})
-          .where((m) {
+    return _db
+        .collection('patients')
+        .where('clinicId', isEqualTo: clinicId)
+        .snapshots()
+        .map((s) {
+          final lowerQ = q.toLowerCase();
+          final matches = <Map<String, dynamic>>[];
+          for (final d in s.docs) {
+            final m = <String, dynamic>{'docId': d.id, ...d.data()};
             final name =
                 '${m['fullName'] ?? m['name'] ?? ''}'.toLowerCase();
             final phone = '${m['phone'] ?? ''}'.toLowerCase();
             final pid = '${m['patientId'] ?? ''}'.toLowerCase();
-            return name.contains(q) ||
-                phone.contains(q) ||
-                pid.contains(q);
-          })
-          .toList();
-      list.sort((a, b) => '${a['fullName'] ?? ''}'
-          .toLowerCase()
-          .compareTo('${b['fullName'] ?? ''}'.toLowerCase()));
-      return list.take(30).toList();
-    });
+            if (name.contains(lowerQ) ||
+                phone.contains(lowerQ) ||
+                pid.contains(lowerQ)) {
+              matches.add(m);
+            }
+          }
+          matches.sort((a, b) => '${a['fullName'] ?? ''}'
+              .toLowerCase()
+              .compareTo('${b['fullName'] ?? ''}'.toLowerCase()));
+          return matches.take(30).toList();
+        });
   }
 }
 
@@ -248,7 +271,13 @@ final patientDocProvider = StreamProvider.autoDispose
 
 final patientSearchProvider = StreamProvider.autoDispose
     .family<List<Map<String, dynamic>>, String>((ref, query) {
-  return ref.read(dashboardServiceProvider).searchPatients(query);
+  final user = ref.watch(currentUserProvider).valueOrNull;
+  final clinicId = user?.clinicId ?? '';
+  if (clinicId.isEmpty) return const Stream.empty();
+  return ref.read(dashboardServiceProvider).searchPatients(
+        clinicId: clinicId,
+        query: query,
+      );
 });
 
 // ----------------------------------------------------------------

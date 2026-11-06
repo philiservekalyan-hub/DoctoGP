@@ -1,3 +1,5 @@
+// lib/features/lab/presentation/lab_receptionist_dashboard.dart
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -15,6 +17,7 @@ import '../../../core/widgets/section_header.dart';
 import '../../../shared/widgets/role_badge.dart';
 import 'lab_order_detail_screen.dart';
 import 'lab_walkin_order_screen.dart';
+import 'sample_label_preview.dart';
 
 // -----------------------------------------------------------------
 // Data providers
@@ -213,7 +216,6 @@ class _LabReceptionistDashboardState
     final all = ordersAsync.valueOrNull ?? const <LabOrderModel>[];
     final items = <Widget>[];
 
-    // Reports awaiting release — payment already settled.
     final awaitingRelease = all.where((o) =>
         o.awaitingRelease &&
         (o.paymentStatus == LabPaymentStatus.paid ||
@@ -230,7 +232,6 @@ class _LabReceptionistDashboardState
       ));
     }
 
-    // Reports uploaded, payment still unpaid.
     final unpaidReady = all.where((o) =>
         o.awaitingRelease &&
         o.paymentStatus == LabPaymentStatus.unpaid &&
@@ -266,7 +267,6 @@ class _LabReceptionistDashboardState
       ));
     }
 
-    // Released reports >24h not yet delivered.
     final readyStale = all.where((o) =>
         o.status == LabOrderStatus.ready &&
         o.released &&
@@ -469,8 +469,6 @@ class _LabReceptionistDashboardState
       ),
     );
 
-  // ── Overflow fix: wrap trailing buttons in Row(mainAxisSize.min)
-  //    so they cannot push the SectionHeader off screen. ──
   Widget _daySwitcher() {
     return Row(children: [
       const Expanded(child: SectionHeader(title: 'Orders by stage')),
@@ -535,64 +533,43 @@ class _LabReceptionistDashboardState
             style: const TextStyle(color: AppColors.error)),
       ),
       data: (_) {
-        final filtered = ref.watch(
-            labReceptionOrdersForDayProvider(_dayFilter));
+  final all = ordersAsync.valueOrNull ?? const <LabOrderModel>[];
+  // Only the "Delivered" section respects the date filter.
+  final delivered = _dayFilter == null
+      ? all.where((o) => o.status == LabOrderStatus.delivered).toList()
+      : ref.watch(labReceptionOrdersForDayProvider(_dayFilter))
+          .where((o) => o.status == LabOrderStatus.delivered)
+          .toList();
 
-        final awaitingRelease =
-            filtered.where((o) => o.awaitingRelease).toList();
-        final readyReleased = filtered
-            .where((o) =>
-                o.status == LabOrderStatus.ready && o.released)
-            .toList();
+  final awaitingRelease =
+      all.where((o) => o.awaitingRelease).toList();
+  final readyReleased = all
+      .where((o) => o.status == LabOrderStatus.ready && o.released)
+      .toList();
 
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _stageSection(
-              context,
-              title: 'New (awaiting acceptance)',
-              statuses: [LabOrderStatus.ordered],
-              orders: filtered,
-            ),
-            const SizedBox(height: 20),
-            _stageSection(
-              context,
-              title: 'Awaiting sample',
-              statuses: [LabOrderStatus.accepted],
-              orders: filtered,
-            ),
-            const SizedBox(height: 20),
-            _stageSection(
-              context,
-              title: 'In progress',
-              statuses: [
-                LabOrderStatus.sampleCollected,
-                LabOrderStatus.processing,
-              ],
-              orders: filtered,
-            ),
-            const SizedBox(height: 20),
-            _customStageSection(
-              context,
-              title: 'Reports awaiting release',
-              orders: awaitingRelease,
-            ),
-            const SizedBox(height: 20),
-            _customStageSection(
-              context,
-              title: 'Ready for pickup',
-              orders: readyReleased,
-            ),
-            const SizedBox(height: 20),
-            _stageSection(
-              context,
-              title: 'Delivered',
-              statuses: [LabOrderStatus.delivered],
-              orders: filtered,
-            ),
-          ],
-        );
-      },
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      _stageSection(context, title: 'New (awaiting acceptance)',
+          statuses: [LabOrderStatus.ordered], orders: all),
+      const SizedBox(height: 20),
+      _stageSection(context, title: 'Awaiting sample',
+          statuses: [LabOrderStatus.accepted], orders: all),
+      const SizedBox(height: 20),
+      _stageSection(context, title: 'In progress',
+          statuses: [LabOrderStatus.sampleCollected, LabOrderStatus.processing],
+          orders: all),
+      const SizedBox(height: 20),
+      _customStageSection(context, title: 'Reports awaiting release',
+          orders: awaitingRelease),
+      const SizedBox(height: 20),
+      _customStageSection(context, title: 'Ready for pickup',
+          orders: readyReleased),
+      const SizedBox(height: 20),
+      _customStageSection(context, title: 'Delivered', orders: delivered),
+    ],
+  );
+},
     );
   }
 
@@ -746,16 +723,21 @@ class _LabOrderRow extends ConsumerWidget {
 
   ({String label, LabOrderStatus next})? get _receptionistAction {
     switch (order.status) {
+      case LabOrderStatus.ordered:
+        return (
+          label: 'Forward to technician',
+          next: LabOrderStatus.accepted
+        );
       case LabOrderStatus.accepted:
         return (
           label: 'Sample collected',
-          next: LabOrderStatus.sampleCollected,
+          next: LabOrderStatus.sampleCollected
         );
       case LabOrderStatus.ready:
         if (order.released) {
           return (
             label: 'Mark delivered',
-            next: LabOrderStatus.delivered,
+            next: LabOrderStatus.delivered
           );
         }
         return null;
@@ -785,7 +767,6 @@ class _LabOrderRow extends ConsumerWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // ── Row 1: icon + tests + status pill ──
               Row(
                 crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
@@ -836,8 +817,6 @@ class _LabOrderRow extends ConsumerWidget {
                   _menu(context, ref),
                 ],
               ),
-
-              // ── Row 2: patient / doctor / time + open arrow ──
               Padding(
                 padding: const EdgeInsets.only(left: 34, top: 4),
                 child: Row(
@@ -886,21 +865,24 @@ class _LabOrderRow extends ConsumerWidget {
                   ],
                 ),
               ),
-
               const SizedBox(height: 8),
               _feesRow(context, ref),
-
               if (order.awaitingRelease) ...[
                 const SizedBox(height: 8),
                 _releaseRow(context, ref),
               ],
-
               if (action != null) ...[
                 const SizedBox(height: 4),
                 Align(
                   alignment: Alignment.centerRight,
                   child: TextButton.icon(
-                    onPressed: () => _advance(context, ref, action),
+                    onPressed: () {
+                      if (order.status == LabOrderStatus.ordered) {
+                        _forward(context, ref);
+                      } else {
+                        _advance(context, ref, action);
+                      }
+                    },
                     icon: const Icon(Icons.arrow_forward_rounded,
                         size: 14),
                     label: Text(action.label),
@@ -923,13 +905,12 @@ class _LabOrderRow extends ConsumerWidget {
     );
   }
 
-
-  // ── Overflow fix: Expanded text + explicit gap before the button
-  //    so the row can't push the button off screen. ──
   Widget _releaseRow(BuildContext context, WidgetRef ref) {
-    final isSettled = order.paymentStatus == LabPaymentStatus.paid ||
-        order.paymentStatus == LabPaymentStatus.waived;
-    final amount = order.billableAmount;
+    final amount = order.billableAmount ?? 0;
+    final isSettled =
+        (order.paymentStatus == LabPaymentStatus.paid ||
+                order.paymentStatus == LabPaymentStatus.waived) &&
+            amount > 0;
 
     if (!isSettled) {
       return Container(
@@ -945,9 +926,9 @@ class _LabOrderRow extends ConsumerWidget {
           const SizedBox(width: 8),
           Expanded(
             child: Text(
-              amount != null && amount > 0
+              amount > 0
                   ? 'Collect ₹${amount.toStringAsFixed(0)} to release report'
-                  : 'Set amount, then collect to release report',
+                  : 'No price set — resolve in catalog or set manually',
               style:
                   AppTextStyles.caption.copyWith(color: AppColors.warning),
             ),
@@ -1038,111 +1019,106 @@ class _LabOrderRow extends ConsumerWidget {
     }
   }
 
-  // ── Overflow fix: Wrap allows the amount pill and action buttons
-  //    to flow onto separate lines instead of overflowing. ──
- Widget _feesRow(BuildContext context, WidgetRef ref) {
-  final amount = order.billableAmount;
-  final isPaid = order.paymentStatus == LabPaymentStatus.paid;
-  final isWaived = order.paymentStatus == LabPaymentStatus.waived;
-  final isSettled = isPaid || isWaived;
-  final isCancelled = order.status == LabOrderStatus.cancelled ||
-      order.status == LabOrderStatus.noShow;
+  Widget _feesRow(BuildContext context, WidgetRef ref) {
+    final amount = order.billableAmount;
+    final isPaid = order.paymentStatus == LabPaymentStatus.paid;
+    final isWaived = order.paymentStatus == LabPaymentStatus.waived;
+    final isSettled = isPaid || isWaived;
+    final isCancelled = order.status == LabOrderStatus.cancelled ||
+        order.status == LabOrderStatus.noShow;
 
-  final color = isSettled
-      ? AppColors.success
-      : (amount == null ? AppColors.warning : AppColors.error);
-  final label = isWaived
-      ? '${amount?.toStringAsFixed(0) ?? '—'} · Waived'
-      : isPaid
-          ? '${amount?.toStringAsFixed(0) ?? '—'} · Paid'
-          : amount == null
-              ? 'Amount not set'
-              : '₹${amount.toStringAsFixed(0)} · Unpaid';
+    final color = isSettled
+        ? AppColors.success
+        : (amount == null ? AppColors.warning : AppColors.error);
+    final label = isWaived
+        ? '${amount?.toStringAsFixed(0) ?? '—'} · Waived'
+        : isPaid
+            ? '${amount?.toStringAsFixed(0) ?? '—'} · Paid'
+            : amount == null
+                ? 'Amount not set'
+                : '₹${amount.toStringAsFixed(0)} · Unpaid';
 
-  final actions = <Widget>[
-    if (!isSettled && !isCancelled) ...[
-      if (amount == null)
-        _compactTextButton(
-          context: context,
-          label: 'Set amount',
-          color: AppColors.info,
-          onTap: () => _openSetAmountDialog(context, ref),
-        )
-      else ...[
-        _compactTextButton(
-          context: context,
-          label: 'Mark paid',
-          color: AppColors.success,
-          onTap: () => _markPaid(context, ref),
-        ),
-        _compactTextButton(
-          context: context,
-          label: 'Waive',
-          color: AppColors.textMuted,
-          onTap: () => _waive(context, ref),
-        ),
-      ],
-    ],
-  ];
-
-  return Wrap(
-    alignment: WrapAlignment.start,
-    crossAxisAlignment: WrapCrossAlignment.center,
-    spacing: 6,
-    runSpacing: 4,
-    children: [
-      Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        decoration: BoxDecoration(
-          color: color.withOpacity(.12),
-          borderRadius: BorderRadius.circular(6),
-        ),
-        child: Row(mainAxisSize: MainAxisSize.min, children: [
-          const Icon(Icons.currency_rupee_rounded,
-              size: 12, color: AppColors.textMuted),
-          const SizedBox(width: 2),
-          Text(
-            label,
-            style: AppTextStyles.caption.copyWith(
-              color: color,
-              fontWeight: FontWeight.w600,
-            ),
+    final actions = <Widget>[
+      if (!isSettled && !isCancelled) ...[
+        if (amount == null)
+          _compactTextButton(
+            context: context,
+            label: 'Set amount',
+            color: AppColors.info,
+            onTap: () => _openSetAmountDialog(context, ref),
+          )
+        else ...[
+          _compactTextButton(
+            context: context,
+            label: 'Mark paid',
+            color: AppColors.success,
+            onTap: () => _markPaid(context, ref),
           ),
-        ]),
-      ),
-      if (actions.isNotEmpty)
-        // Inner Wrap — the action buttons flow to a second line if they
-        // can't fit next to each other on the current row. This is what
-        // eliminates the 20px overflow at 270px width.
-        Wrap(
-          spacing: 0,
-          runSpacing: 0,
-          children: actions,
-        ),
-    ],
-  );
-}
+          _compactTextButton(
+            context: context,
+            label: 'Waive',
+            color: AppColors.textMuted,
+            onTap: () => _waive(context, ref),
+          ),
+        ],
+      ],
+    ];
 
-/// Minimal TextButton tuned for narrow action rows.
-Widget _compactTextButton({
-  required BuildContext context,
-  required String label,
-  required Color color,
-  required VoidCallback onTap,
-}) {
-  return TextButton(
-    onPressed: onTap,
-    style: TextButton.styleFrom(
-      foregroundColor: color,
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      minimumSize: const Size(0, 28),
-      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-      visualDensity: VisualDensity.compact,
-      textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-    ),
-    child: Text(label),
-  );
-}
+    return Wrap(
+      alignment: WrapAlignment.start,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      spacing: 6,
+      runSpacing: 4,
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: BoxDecoration(
+            color: color.withOpacity(.12),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.currency_rupee_rounded,
+                size: 12, color: AppColors.textMuted),
+            const SizedBox(width: 2),
+            Text(
+              label,
+              style: AppTextStyles.caption.copyWith(
+                color: color,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ]),
+        ),
+        if (actions.isNotEmpty)
+          Wrap(
+            spacing: 0,
+            runSpacing: 0,
+            children: actions,
+          ),
+      ],
+    );
+  }
+
+  Widget _compactTextButton({
+    required BuildContext context,
+    required String label,
+    required Color color,
+    required VoidCallback onTap,
+  }) {
+    return TextButton(
+      onPressed: onTap,
+      style: TextButton.styleFrom(
+        foregroundColor: color,
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        minimumSize: const Size(0, 28),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        visualDensity: VisualDensity.compact,
+        textStyle:
+            const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+      ),
+      child: Text(label),
+    );
+  }
 
   Future<void> _openSetAmountDialog(
       BuildContext context, WidgetRef ref) async {
@@ -1248,13 +1224,16 @@ Widget _compactTextButton({
     }
   }
 
-  Widget _menu(BuildContext context, WidgetRef ref) {
+    Widget _menu(BuildContext context, WidgetRef ref) {
     return PopupMenuButton<String>(
       icon: const Icon(Icons.more_vert_rounded,
           color: AppColors.textMuted, size: 18),
       color: AppColors.surface,
       onSelected: (value) async {
         switch (value) {
+          case 'reprint_labels':
+            await _reprintLabels(context, ref);
+            break;
           case 'cancel':
             await _run(
               context,
@@ -1274,6 +1253,15 @@ Widget _compactTextButton({
         }
       },
       itemBuilder: (_) => [
+        if (order.sampleGroups.isNotEmpty)
+          const PopupMenuItem(
+            value: 'reprint_labels',
+            child: _MenuRow(
+              icon: Icons.print_rounded,
+              label: 'Reprint sample labels',
+              color: AppColors.info,
+            ),
+          ),
         if (order.status != LabOrderStatus.delivered &&
             order.status != LabOrderStatus.cancelled &&
             order.status != LabOrderStatus.noShow)
@@ -1298,19 +1286,35 @@ Widget _compactTextButton({
     );
   }
 
-  Future<void> _advance(
-    BuildContext context,
-    WidgetRef ref,
-    ({String label, LabOrderStatus next}) action,
-  ) async {
+  Future<void> _reprintLabels(BuildContext context, WidgetRef ref) async {
+    if (order.sampleGroups.isEmpty) return;
+    await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (_) => SampleLabelsPreviewSheet(
+        order: order,
+        groups: order.sampleGroups,
+        collectedAt: order.sampleCollectedAt ?? DateTime.now(),
+      ),
+    );
+  }
+
+  Future<void> _forward(BuildContext context, WidgetRef ref) async {
+    final user = ref.read(currentUserProvider).valueOrNull;
+    if (user == null) return;
     try {
-      await ref
-          .read(labServiceProvider)
-          .updateStatus(order.docId, action.next);
+      await ref.read(labServiceProvider).forwardToTechnician(
+            orderId: order.docId,
+            forwardedByUid: user.uid,
+          );
       if (!context.mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content:
-            Text('${order.patientName} — ${action.label.toLowerCase()}'),
+        content: Text('${order.patientName} — forwarded to lab technician'),
         backgroundColor: AppColors.success,
       ));
       onChanged();
@@ -1321,6 +1325,82 @@ Widget _compactTextButton({
         backgroundColor: AppColors.error,
       ));
     }
+  }
+
+ Future<void> _advance(
+    BuildContext context,
+    WidgetRef ref,
+    ({String label, LabOrderStatus next}) action,
+  ) async {
+    // Capture navigator context BEFORE awaiting, so it survives the
+    // post-write rebuild that disposes this row widget.
+    final navContext = Navigator.of(context, rootNavigator: true).context;
+    final scaffoldMessenger = ScaffoldMessenger.of(context);
+
+    try {
+      await ref
+          .read(labServiceProvider)
+          .updateStatus(order.docId, action.next);
+
+      scaffoldMessenger.showSnackBar(SnackBar(
+        content:
+            Text('${order.patientName} — ${action.label.toLowerCase()}'),
+        backgroundColor: AppColors.success,
+      ));
+
+      onChanged();
+
+      if (action.next == LabOrderStatus.sampleCollected) {
+        // Small delay so the stream-rebuild disposes this row first;
+        // then we open the sheet on the (still-mounted) navigator.
+        await Future.delayed(const Duration(milliseconds: 300));
+        if (!navContext.mounted) return;
+        await _maybePrintSampleLabel(navContext, ref);
+      }
+    } catch (e) {
+      scaffoldMessenger.showSnackBar(SnackBar(
+        content: Text('Failed: $e'),
+        backgroundColor: AppColors.error,
+      ));
+    }
+  }
+
+  /// Reads the fresh order doc to pick up sampleGroups assigned by
+  /// updateStatus, then opens the multi-label print preview.
+  Future<void> _maybePrintSampleLabel(
+    BuildContext context, // ← this is now the navigator's context
+    WidgetRef ref,
+  ) async {
+    final updated = await FirebaseFirestore.instance
+        .collection('labOrders')
+        .doc(order.docId)
+        .get();
+    final fresh = LabOrderModel.fromMap(order.docId, updated.data() ?? {});
+
+    if (fresh.sampleGroups.isEmpty) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Sample IDs were not generated.'),
+        backgroundColor: AppColors.warning,
+      ));
+      return;
+    }
+
+    if (!context.mounted) return;
+    await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (_) => SampleLabelsPreviewSheet(
+        order: fresh,
+        groups: fresh.sampleGroups,
+        collectedAt: DateTime.now(),
+      ),
+    );
   }
 
   Future<void> _run(

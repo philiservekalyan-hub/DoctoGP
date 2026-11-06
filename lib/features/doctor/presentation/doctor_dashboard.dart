@@ -10,6 +10,7 @@ import '../../../app/theme/app_colors.dart';
 import '../../../app/theme/app_text_styles.dart';
 import '../../../core/models/appointment_model.dart';
 import '../../../core/models/lab_order_model.dart';
+import '../../../core/models/user_model.dart';        // UserRole
 import '../../../core/providers/service_providers.dart';
 import '../../../core/widgets/glass_card.dart';
 import '../../../core/widgets/section_header.dart';
@@ -47,7 +48,7 @@ class DoctorDashboard extends ConsumerWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  _header(context, ref, user?.name ?? ''),
+                  _header(context, ref, user),
                   const SizedBox(height: 24),
                   _statsRow(ref),
                   const SizedBox(height: 12),
@@ -83,7 +84,9 @@ class DoctorDashboard extends ConsumerWidget {
     );
   }
 
-  Widget _header(BuildContext context, WidgetRef ref, String name) {
+  Widget _header(
+      BuildContext context, WidgetRef ref, UserModel? user) {
+    final isOwner = user?.role == UserRole.owner;
     return Row(children: [
       Expanded(
         child: Column(
@@ -91,10 +94,18 @@ class DoctorDashboard extends ConsumerWidget {
           children: [
             Text('Welcome back,', style: AppTextStyles.bodyMuted),
             const SizedBox(height: 4),
-            Text('Dr. $name', style: AppTextStyles.h1),
+            Text('Dr. ${user?.name ?? ''}', style: AppTextStyles.h1),
           ],
         ),
       ),
+      // Owner-only: jump to the owner dashboard.
+      if (isOwner)
+        IconButton(
+          tooltip: 'Owner dashboard',
+          onPressed: () => context.push('/doctor/owner'),
+          icon: const Icon(Icons.insights_rounded,
+              color: AppColors.textSecondary),
+        ),
       IconButton(
         tooltip: 'New lab order',
         onPressed: () => _openCreateLab(context, ref),

@@ -88,33 +88,8 @@ class ReceptionStatsService {
     );
   }
 
-  // ---------------------------------------------------------------
-  // Search — patient by name / phone / ID, then their history
-  // ---------------------------------------------------------------
-  Stream<List<Map<String, dynamic>>> searchPatients(String q) {
-    final query = q.trim().toLowerCase();
-    if (query.isEmpty) return const Stream.empty();
-
-    // Firestore can't do case-insensitive contains, so fetch a page and
-    // filter client-side. For a clinic-sized patient list this is fine.
-    return _db
-        .collection('patients')
-        .limit(300)
-        .snapshots()
-        .map((s) => s.docs
-            .map((d) => <String, dynamic>{'docId': d.id, ...d.data()})
-            .where((p) {
-              final name = '${p['fullName'] ?? ''}'.toLowerCase();
-              final phone = '${p['phone'] ?? ''}'.toLowerCase();
-              final pid = '${p['patientId'] ?? ''}'.toLowerCase();
-              return name.contains(query) ||
-                  phone.contains(query) ||
-                  pid.contains(query);
-            })
-            .toList());
-  }
-
-  Stream<List<AppointmentModel>> patientAppointments(String patientDocId) {
+  Stream<List<AppointmentModel>> patientAppointments(
+      String patientDocId) {
     return _db
         .collection('appointments')
         .where('patientDocId', isEqualTo: patientDocId)
@@ -301,14 +276,12 @@ final todayInvoiceStatsProvider =
   return ref.watch(receptionStatsServiceProvider).todayInvoices();
 });
 
-final patientSearchProvider = StreamProvider.autoDispose
-    .family<List<Map<String, dynamic>>, String>((ref, q) {
-  return ref.watch(receptionStatsServiceProvider).searchPatients(q);
-});
-
-final patientAppointmentsProvider = StreamProvider.autoDispose
-    .family<List<AppointmentModel>, String>((ref, patientDocId) {
-  return ref
-      .watch(receptionStatsServiceProvider)
-      .patientAppointments(patientDocId);
-});
+// NOTE:
+// `searchPatients`, `patientSearchProvider`, and
+// `patientAppointmentsProvider` have been REMOVED from this file.
+// They are defined ONLY in `dashboard_service.dart` — with the
+// clinicId-scoped query that satisfies the Firestore rules.
+//
+// If any screen was importing `patientSearchProvider` or
+// `patientAppointmentsProvider` from THIS file, update that import
+// to point at `dashboard_service.dart` instead.

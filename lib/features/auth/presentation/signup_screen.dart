@@ -1,3 +1,4 @@
+// lib/features/auth/presentation/signup_screen.dart
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
@@ -38,9 +39,30 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
     super.dispose();
   }
 
-  // -----------------------------------------------------------------
-  // Main signup flow
-  // -----------------------------------------------------------------
+  String _normalizePhone(String raw) {
+    final digits = raw.replaceAll(RegExp(r'\D'), '');
+    if (digits.length == 12 && digits.startsWith('91')) {
+      return digits.substring(2);
+    }
+    if (digits.length == 11 && digits.startsWith('0')) {
+      return digits.substring(1);
+    }
+    return digits;
+  }
+
+  String _maskPhone(String p) {
+    if (p.length <= 4) return '****';
+    return '...${p.substring(p.length - 4)}';
+  }
+
+  String _maskEmail(String e) {
+    if (e.isEmpty) return '—';
+    final at = e.indexOf('@');
+    if (at <= 0) return e;
+    if (at <= 2) return '***@${e.substring(at + 1)}';
+    return '${e.substring(0, 2)}***@${e.substring(at + 1)}';
+  }
+
   Future<void> _signUp() async {
     if (_name.text.trim().isEmpty ||
         _email.text.trim().isEmpty ||
@@ -63,6 +85,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
     });
 
     final normalizedEmail = _email.text.trim().toLowerCase();
+    final normalizedPhone = _normalizePhone(_phone.text);
     final db = FirebaseFirestore.instance;
 
     // -----------------------------------------------------------------
@@ -97,14 +120,16 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
     final uid = cred.user!.uid;
 
     // -----------------------------------------------------------------
-    // Step 2 — Role resolution (owner → invite → patient → reject)
-    //
-    // Any failure from here on rolls back the just-created Auth account
-    // so the user can retry with the same email cleanly.
+    // Step 2 — Role resolution
+    //   2a. Owner
+    //   2b. Invite
+    //   2c. Clinic patient (patients collection)
+    //   2d. Lab customer (labCustomers collection) — with confirmation
+    //   2e. No match → rollback + reject
     // -----------------------------------------------------------------
     try {
       // -------------------------------------------------------------
-      // 2a. Owner — clinic registered with this email as ownerEmail
+      // 2a. Owner
       // -------------------------------------------------------------
       final ownerSnap = await db
           .collection('clinics')
@@ -125,13 +150,20 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
         await db.collection('users').doc(uid).set({
           'name': _name.text.trim(),
           'email': normalizedEmail,
-          'phone': _phone.text.trim(),
+          'phone': normalizedPhone,
           'role': 'owner',
           'clinicId': clinicId,
           'clinicCode': clinicData['clinicCode'],
           'clinicName': clinicData['name'],
+          'orgType': clinicData['orgType'] ?? clinicData['type'],
+          'isDoctor': clinicData['ownerIsDoctor'] == true,
+          'isLabOwner': clinicData['ownerIsLabOwner'] == true,
+          'canPractise': clinicData['ownerIsDoctor'] == true,
+          'authUid': uid,
           'active': true,
           'createdAt': FieldValue.serverTimestamp(),
+          'updatedAt': FieldValue.serverTimestamp(),
+          'updatedByUid': uid,
         });
 
         if (!mounted) return;
@@ -140,7 +172,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
       }
 
       // -------------------------------------------------------------
-      // 2b. Invite — a pending invite for this email (staff signup)
+      // 2b. Invite
       // -------------------------------------------------------------
       final inviteSnap = await db
           .collection('invites')
@@ -154,10 +186,11 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
         final invite = inviteDoc.data();
         final role = invite['role'] as String? ?? 'receptionist';
         final clinicId = invite['clinicId'] as String?;
+        final inviteOrgType = invite['orgType'] as String?;
 
-        // Fetch clinic code + name (for the users doc)
         String? clinicCode;
         String? clinicName;
+        String? derivedOrgType;
         if (clinicId != null) {
           final clinicDoc =
               await db.collection('clinics').doc(clinicId).get();
@@ -165,20 +198,31 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
             final cData = clinicDoc.data() ?? {};
             clinicCode = cData['clinicCode'] as String?;
             clinicName = cData['name'] as String?;
+            derivedOrgType =
+                (cData['orgType'] ?? cData['type']) as String?;
           }
         }
 
         await db.collection('users').doc(uid).set({
           'name': invite['name'] ?? _name.text.trim(),
           'email': normalizedEmail,
-          'phone': _phone.text.trim(),
+          'phone': normalizedPhone.isNotEmpty
+              ? normalizedPhone
+              : (invite['phone'] ?? ''),
           'role': role,
           'clinicId': clinicId,
           'clinicCode': clinicCode,
           'clinicName': clinicName,
+          'orgType': inviteOrgType ?? derivedOrgType ?? 'clinic',
+          'isDoctor': role == 'doctor',
+          'isLabOwner': false,
+          'canPractise': role == 'doctor',
           'specialization': invite['specialization'],
+          'authUid': uid,
           'active': true,
           'createdAt': FieldValue.serverTimestamp(),
+          'updatedAt': FieldValue.serverTimestamp(),
+          'updatedByUid': uid,
         });
 
         await inviteDoc.reference.update({
@@ -193,7 +237,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
       }
 
       // -------------------------------------------------------------
-      // 2c. Patient — a patient doc already exists for this email
+      // 2c. Clinic patient
       // -------------------------------------------------------------
       final patientSnap = await db
           .collection('patients')
@@ -206,7 +250,6 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
         final patientData = patientDoc.data();
         final clinicId = patientData['clinicId'] as String?;
 
-        // Fetch clinic code + name
         String? clinicCode;
         String? clinicName;
         if (clinicId != null) {
@@ -222,19 +265,19 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
         await db.collection('users').doc(uid).set({
           'name': patientData['fullName'] ?? _name.text.trim(),
           'email': normalizedEmail,
-          'phone': patientData['phone'] ?? _phone.text.trim(),
+          'phone': patientData['phone'] ?? normalizedPhone,
           'role': 'patient',
           'clinicId': clinicId,
           'clinicCode': clinicCode,
           'clinicName': clinicName,
           'linkedPatientDocId': patientDoc.id,
+          'authUid': uid,
           'active': true,
           'createdAt': FieldValue.serverTimestamp(),
+          'updatedAt': FieldValue.serverTimestamp(),
+          'updatedByUid': uid,
         });
 
-        // Link the patient doc to this Auth UID so future reads
-        // resolve to the right user. The rule allows this exact
-        // field change during signup.
         await patientDoc.reference.update({
           'userId': uid,
           'appRegisteredAt': FieldValue.serverTimestamp(),
@@ -246,16 +289,111 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
       }
 
       // -------------------------------------------------------------
-      // 2d. No match — clean up and reject
+      // 2d. Lab customer — either-match lookup, then confirmation.
+      // -------------------------------------------------------------
+      var labCustomerSnap = await db
+          .collection('labCustomers')
+          .where('phone', isEqualTo: normalizedPhone)
+          .limit(5)
+          .get();
+
+      if (labCustomerSnap.docs.isEmpty && normalizedEmail.isNotEmpty) {
+        labCustomerSnap = await db
+            .collection('labCustomers')
+            .where('email', isEqualTo: normalizedEmail)
+            .limit(5)
+            .get();
+      }
+
+      if (labCustomerSnap.docs.isNotEmpty) {
+        final matched = labCustomerSnap.docs.first;
+        final data = matched.data();
+        final matchedName = (data['fullName'] ?? '').toString();
+        final matchedPhone = (data['phone'] ?? '').toString();
+        final matchedEmail = (data['email'] ?? '').toString();
+        final labClinicId = (data['labClinicId'] ?? '').toString();
+
+        String? labName;
+        if (labClinicId.isNotEmpty) {
+          final labDoc =
+              await db.collection('clinics').doc(labClinicId).get();
+          if (labDoc.exists) {
+            labName = labDoc.data()?['name'] as String?;
+          }
+        }
+
+        if (!mounted) return;
+        final confirmed = await _confirmLabCustomerMatch(
+          name: matchedName,
+          phone: matchedPhone,
+          email: matchedEmail,
+          labName: labName ?? 'a lab',
+        );
+
+        if (confirmed != true) {
+          await _rollbackAuth(cred);
+          if (!mounted) return;
+          setState(() {
+            _loading = false;
+            _error = "The record we found doesn't match you. Please contact "
+                'your lab to correct your phone or email, then try again.';
+          });
+          return;
+        }
+
+        final displayPatientId = data['displayPatientId'] as String?;
+
+        String? labCode;
+        if (labClinicId.isNotEmpty) {
+          final labDoc =
+              await db.collection('clinics').doc(labClinicId).get();
+          if (labDoc.exists) {
+            labCode = labDoc.data()?['clinicCode'] as String?;
+          }
+        }
+
+        await db.collection('users').doc(uid).set({
+          'name': matchedName.isEmpty ? _name.text.trim() : matchedName,
+          'email': normalizedEmail,
+          'phone': matchedPhone.isEmpty ? normalizedPhone : matchedPhone,
+          'role': 'patient',
+          'clinicId': labClinicId.isEmpty ? null : labClinicId,
+          'clinicCode': labCode,
+          'clinicName': labName,
+          'linkedLabCustomerDocId': matched.id,
+          'linkedDisplayPatientId': displayPatientId,
+          'authUid': uid,
+          'active': true,
+          'createdAt': FieldValue.serverTimestamp(),
+          'updatedAt': FieldValue.serverTimestamp(),
+          'updatedByUid': uid,
+        });
+
+        final batch = db.batch();
+        for (final doc in labCustomerSnap.docs) {
+          batch.update(doc.reference, {
+            'linkedUserUid': uid,
+            'linkedAt': FieldValue.serverTimestamp(),
+          });
+        }
+        await batch.commit();
+
+        if (!mounted) return;
+        context.go('/patient');
+        return;
+      }
+
+      // -------------------------------------------------------------
+      // 2e. No match
       // -------------------------------------------------------------
       await _rollbackAuth(cred);
 
       if (!mounted) return;
       setState(() {
         _loading = false;
-        _error = 'This email is not registered with any clinic. '
-            'Ask your clinic to add you, or use the email '
-            'they registered for you.';
+        _error = 'This email or phone is not registered with any clinic '
+            'or lab. Ask your clinic or lab to add you, or use the '
+            'contact details they registered for you.';
       });
     } catch (e) {
       debugPrint('[SIGNUP] failed after auth creation: $e');
@@ -269,9 +407,130 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
     }
   }
 
-  /// Deletes the just-created Auth account. Falls back to signOut if
-  /// delete fails (e.g., requires-recent-login). Logs any failure so
-  /// orphan accounts don't accumulate silently.
+  Future<bool?> _confirmLabCustomerMatch({
+    required String name,
+    required String phone,
+    required String email,
+    required String labName,
+  }) {
+    return showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      isDismissible: false,
+      enableDrag: false,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (sheetContext) => ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(sheetContext).size.height * 0.85,
+        ),
+        child: SingleChildScrollView(
+          padding: EdgeInsets.fromLTRB(
+            24, 24, 24,
+            MediaQuery.of(sheetContext).viewInsets.bottom + 24,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(children: [
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: AppColors.info.withOpacity(.13),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: const Icon(Icons.person_search_rounded,
+                      color: AppColors.info, size: 22),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text('We found a record for you',
+                      style: AppTextStyles.h3),
+                ),
+              ]),
+              const SizedBox(height: 12),
+              Text(
+                'Please confirm this is your record before we link it to your '
+                'account. This helps keep your medical data safe.',
+                style: AppTextStyles.bodyMuted,
+              ),
+              const SizedBox(height: 18),
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: AppColors.background,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: AppColors.cardBorder),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _matchRow('Name', name.isEmpty ? '—' : name),
+                    const SizedBox(height: 8),
+                    _matchRow('Phone', _maskPhone(phone)),
+                    const SizedBox(height: 8),
+                    _matchRow('Email', _maskEmail(email)),
+                    const SizedBox(height: 8),
+                    _matchRow('Lab', labName),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'If any of the above is wrong, contact the lab to correct it '
+                'before signing up.',
+                style: AppTextStyles.caption,
+              ),
+              const SizedBox(height: 20),
+              ElevatedButton.icon(
+                onPressed: () => Navigator.of(sheetContext).pop(true),
+                icon: const Icon(Icons.check_rounded),
+                label: const Text('Yes, this is me'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.success,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                ),
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton(
+                onPressed: () => Navigator.of(sheetContext).pop(false),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: AppColors.error,
+                  side: const BorderSide(color: AppColors.error),
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                ),
+                child: const Text('No, this is not my record'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _matchRow(String label, String value) => Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 80,
+            child: Text(label, style: AppTextStyles.bodyMuted),
+          ),
+          Expanded(
+            child: Text(value,
+                style: AppTextStyles.body
+                    .copyWith(fontWeight: FontWeight.w500)),
+          ),
+        ],
+      );
+
   Future<void> _rollbackAuth(UserCredential? cred) async {
     final user = cred?.user;
     if (user == null) return;
@@ -360,7 +619,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
                 Text('Create an account', style: AppTextStyles.h1),
                 const SizedBox(height: 8),
                 Text(
-                  'For clinic owners, staff, and registered patients',
+                  'For clinic owners, staff, registered patients, and lab customers',
                   style: AppTextStyles.bodyMuted,
                 ),
                 const SizedBox(height: 32),

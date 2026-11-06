@@ -267,6 +267,72 @@ class _CanonicalTestsScreenState
                         ),
                       ),
                     ),
+                  PopupMenuButton<String>(
+                    icon: const Icon(Icons.more_vert_rounded,
+                        size: 18, color: AppColors.textMuted),
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    onSelected: (v) async {
+                      final svc =
+                          ref.read(canonicalTestServiceProvider);
+                      switch (v) {
+                        case 'edit':
+                          _openEdit(context, t);
+                          break;
+                        case 'toggle':
+                          if (inactive) {
+                            await svc.reactivate(t.testId);
+                          } else {
+                            await svc.deactivate(t.testId);
+                          }
+                          break;
+                        case 'delete':
+                          await _confirmDelete(context, t);
+                          break;
+                      }
+                    },
+                    itemBuilder: (_) => [
+                      const PopupMenuItem(
+                        value: 'edit',
+                        child: ListTile(
+                          leading:
+                              Icon(Icons.edit_rounded, size: 18),
+                          title: Text('Edit'),
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                        ),
+                      ),
+                      PopupMenuItem(
+                        value: 'toggle',
+                        child: ListTile(
+                          leading: Icon(
+                            inactive
+                                ? Icons.restore_rounded
+                                : Icons.visibility_off_rounded,
+                            size: 18,
+                          ),
+                          title: Text(
+                              inactive ? 'Reactivate' : 'Deactivate'),
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                        ),
+                      ),
+                      const PopupMenuItem(
+                        value: 'delete',
+                        child: ListTile(
+                          leading: Icon(
+                              Icons.delete_forever_rounded,
+                              size: 18,
+                              color: AppColors.error),
+                          title: Text('Delete',
+                              style:
+                                  TextStyle(color: AppColors.error)),
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                        ),
+                      ),
+                    ],
+                  ),
                 ]),
                 const SizedBox(height: 6),
                 Row(children: [
@@ -313,5 +379,128 @@ class _CanonicalTestsScreenState
         builder: (_) => CreateCanonicalTestScreen(existing: t),
       ),
     );
+  }
+
+  // ── Delete flow ──
+
+  Future<void> _confirmDelete(
+      BuildContext context, CanonicalTestModel t) async {
+    final service = ref.read(canonicalTestServiceProvider);
+
+    // 1. Brief loader while we hit Firestore
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(
+        child: CircularProgressIndicator(color: AppColors.primary),
+      ),
+    );
+
+    late final ({bool referenced, int totalRefs, Map<String, int> byCollection})
+        refs;
+    try {
+      refs = await service.checkReferences(t.testId);
+    } catch (e) {
+      if (context.mounted) {
+        Navigator.of(context, rootNavigator: true).pop();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Reference check failed: $e')),
+        );
+      }
+      return;
+    }
+
+    if (!context.mounted) return;
+    Navigator.of(context, rootNavigator: true).pop(); // close loader
+
+    // 2a. Test IS referenced → cannot delete, offer Edit / Deactivate
+    if (refs.referenced) {
+      final usage = refs.byCollection.entries
+          .map((e) => '• ${e.key}: ${e.value}')
+          .join('\n');
+      final action = await showDialog<String>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Cannot delete'),
+          content: Text(
+            '"${t.code} — ${t.name}" is already used:\n\n'
+            '$usage\n\n'
+            'Deleting it would break those records. You can deactivate '
+            'it instead — it will be hidden from new selections but '
+            'kept for history.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'edit'),
+              child: const Text('Edit instead'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                  backgroundColor: AppColors.warning),
+              onPressed: () => Navigator.pop(ctx, 'deactivate'),
+              child: const Text('Deactivate'),
+            ),
+          ],
+        ),
+      );
+
+      if (action == 'edit' && context.mounted) {
+        _openEdit(context, t);
+      } else if (action == 'deactivate') {
+        await service.deactivate(t.testId);
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Test deactivated')),
+          );
+        }
+      }
+      return;
+    }
+
+    // 2b. Test is NOT referenced → hard delete after confirmation
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete test?'),
+        content: Text(
+          '"${t.code} — ${t.name}"\n\n'
+          'This test is not used by any lab, so it can be safely '
+          'removed.\n\nThis cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+                backgroundColor: AppColors.error),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (ok != true) return;
+
+    try {
+      await service.hardDelete(t.testId);
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Test deleted')),
+        );
+      }
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Delete failed: $e')),
+        );
+      }
+    }
   }
 }

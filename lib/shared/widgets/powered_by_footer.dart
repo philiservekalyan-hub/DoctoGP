@@ -6,10 +6,10 @@ import '../../app/theme/app_colors.dart';
 class PoweredByFooter extends StatelessWidget {
   const PoweredByFooter({super.key});
 
-  static const String _appName = 'DoctoGP';
-  static const String _supportEmail = 'support@doctogp.com';
+  static const String _appName = 'STAT';
+  static const String _supportEmail = 'support@stat.in';
   static const String _supportPhone = '+919876543210';
-  static const String _supportUrl = 'https://doctogp.com';
+  static const String _supportUrl = 'https://stat.in';
 
   Future<void> _launch(BuildContext context, Uri uri) async {
     try {

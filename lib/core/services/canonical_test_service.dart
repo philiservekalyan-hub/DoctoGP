@@ -71,7 +71,8 @@ class CanonicalTestService {
     final trimmedName = name.trim();
 
     // 2. Validate code format
-    final codeRegex = RegExp(r'^[A-Z0-9_]{2,12}$');
+    final codeRegex =
+        RegExp(r'^[A-Z0-9][A-Z0-9 _\-/.:#&+()]{0,28}[A-Z0-9]$');
     if (!codeRegex.hasMatch(trimmedCode)) {
       return (
         result: CanonicalTestWriteResult.invalidCodeFormat,
@@ -172,6 +173,61 @@ class CanonicalTestService {
       'updatedByUid': user?.uid,
       'updatedAt': FieldValue.serverTimestamp(),
     });
+  }
+
+  // ── Reference check + hard delete ──
+
+  /// Whether this canonical test is referenced by any lab.
+  ///
+  /// Lab offerings live at:
+  ///   clinics/{clinicId}/catalog/labTests/{testId}
+  /// and the doc ID equals the canonical testId, so a single
+  /// collection-group doc lookup tells us if it's in use — O(1),
+  /// no query, no index required.
+  ///
+  /// The `clinics/{c}/catalog/main.tests` array is a denormalized
+  /// mirror of `labTests` and is kept in sync on every write, so
+  /// it is not checked separately.
+  Future<({bool referenced, int totalRefs, Map<String, int> byCollection})>
+      checkReferences(String testId) async {
+    final byCollection = <String, int>{};
+    var total = 0;
+
+    try {
+      final snap = await FirebaseFirestore.instance
+          .collectionGroup('labTests')
+          .where(FieldPath.documentId, isEqualTo: testId)
+          .limit(1)
+          .get();
+      if (snap.docs.isNotEmpty) {
+        byCollection['labTests'] = 1;
+        total += 1;
+      }
+    } on FirebaseException catch (e) {
+      // ignore: avoid_print
+      print('[checkReferences] labTests lookup failed: ${e.code}');
+    }
+
+    return (
+      referenced: total > 0,
+      totalRefs: total,
+      byCollection: byCollection,
+    );
+  }
+
+  /// Hard-delete a canonical test. ONLY call after [checkReferences]
+  /// confirms the test is unreferenced. Re-checks at write time as a
+  /// race guard and throws [StateError] if a reference appeared in
+  /// between.
+  Future<void> hardDelete(String testId) async {
+    final refs = await checkReferences(testId);
+    if (refs.referenced) {
+      final detail = refs.byCollection.entries
+          .map((e) => '${e.key}(${e.value})')
+          .join(', ');
+      throw StateError('Cannot delete: test is referenced by $detail');
+    }
+    await _col.doc(testId).delete();
   }
 }
 

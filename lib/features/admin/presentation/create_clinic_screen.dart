@@ -1,4 +1,5 @@
 // lib/features/admin/presentation/create_clinic_screen.dart
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -11,8 +12,6 @@ import '../../../core/widgets/tag_input.dart';
 import '../../../shared/widgets/clinic_app_bar.dart';
 
 class CreateClinicScreen extends ConsumerStatefulWidget {
-  /// When true, this screen is displayed inside AdminShell (with its own AppBar).
-  /// When false, it's pushed as a full-screen page from the dashboard.
   final bool embedded;
 
   const CreateClinicScreen({super.key, this.embedded = false});
@@ -25,7 +24,6 @@ class CreateClinicScreen extends ConsumerStatefulWidget {
 class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
   final _formKey = GlobalKey<FormState>();
 
-  // Type — "clinic" or "lab"
   String _type = 'clinic';
 
   // Identity
@@ -73,6 +71,11 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
   final _ownerName = TextEditingController();
   final _ownerPhone = TextEditingController();
 
+  // Owner is also a practising doctor — meaningful for labs,
+  // where an owner may consult patients in their own lab.
+  // For clinics, isDoctor is implied by the entity type.
+  bool _ownerIsDoctor = false;
+
   // Advanced
   String _subscriptionPlan = 'starter';
   bool _whatsappEnabled = true;
@@ -118,10 +121,8 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
 
     try {
       final data = <String, dynamic>{
-        // Type — distinguishes clinic from lab
         'type': _type,
 
-        // Identity
         'name': _name.text.trim(),
         'displayName': _displayName.text.trim().isEmpty
             ? _name.text.trim()
@@ -133,7 +134,6 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
             ? _generateCode()
             : _clinicCode.text.trim().toUpperCase(),
 
-        // Contact
         'primaryPhone': _primaryPhone.text.trim(),
         'secondaryPhone': _secondaryPhone.text.trim().isEmpty
             ? null
@@ -150,8 +150,10 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
 
         'clinicOwnerName': _ownerName.text.trim(),
         'ownerEmail': _ownerEmail.text.trim().toLowerCase(),
+	'orgType': _type,
+	'ownerIsDoctor': _ownerIsDoctor || _type == 'clinic',
+	'ownerIsLabOwner': _type == 'lab',
 
-        // Address
         'practiceAddress': {
           'line1': _line1.text.trim(),
           'line2': _line2.text.trim().isEmpty
@@ -164,7 +166,6 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
           'country': 'India',
         },
 
-        // Registration
         'clinicRegistrationNumber': _clinicRegNumber.text.trim().isEmpty
             ? null
             : _clinicRegNumber.text.trim(),
@@ -178,13 +179,11 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
             ? null
             : _dltEntityId.text.trim(),
 
-        // Shared operational defaults
         'timezone': 'Asia/Kolkata',
         'whatsappEnabled': _whatsappEnabled,
         'pushNotificationsEnabled': true,
         'emailEnabled': true,
 
-        // Clinic-only fields
         if (_type == 'clinic') ...{
           'currency': 'INR',
           'taxPercent': 18,
@@ -218,21 +217,79 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
       final clinicId =
           await ref.read(adminServiceProvider).createClinic(data);
 
+      // ── Attach owner ──
       String? ownerAttachMessage;
       if (_ownerEmail.text.trim().isNotEmpty) {
-        final uid = await ref
-            .read(adminServiceProvider)
-            .findUserIdByEmail(_ownerEmail.text.trim());
-        if (uid != null) {
-          await ref.read(adminServiceProvider).attachClinicToUser(
-                userId: uid,
-                clinicId: clinicId,
-                role: _type == 'lab' ? 'lab' : 'receptionist',
-              );
-          ownerAttachMessage = 'Owner account linked.';
-        } else {
+        // Resolve owner uid by email
+        String? uid;
+        try {
+          uid = await ref
+              .read(adminServiceProvider)
+              .findUserIdByEmail(_ownerEmail.text.trim());
+        } catch (e) {
+          debugPrint('createClinic: findUserIdByEmail failed '
+              'email=${_ownerEmail.text.trim()} error=$e');
+        }
+
+        if (uid == null) {
           ownerAttachMessage =
-              '${_type == 'lab' ? 'Lab' : 'Clinic'} created. Owner email not found in users — they must sign up first, then you can link them.';
+              '${_type == 'lab' ? 'Lab' : 'Clinic'} created. Owner email '
+              'not found in users — they must sign up first, then you '
+              'can link them.';
+        } else {
+          // Resolve effective isDoctor for this owner.
+          //   • Clinics: owner is assumed to be a doctor (most GPs own).
+          //   • Labs:    owner is a doctor only if the checkbox was ticked.
+          final effectiveIsDoctor =
+              _ownerIsDoctor || _type == 'clinic';
+
+          try {
+            await ref.read(adminServiceProvider).attachClinicToUser(
+                  userId: uid,
+                  clinicId: clinicId,
+                  role: 'owner',
+                  orgType: _type, // 'clinic' or 'lab'
+                  isDoctor: effectiveIsDoctor,
+                  isLabOwner: _type == 'lab',
+                );
+
+            // Verify the fields landed on the user doc. If a rule
+            // silently drops some fields, or the wrong doc was
+            // touched, surface it now — not 20 minutes later.
+            final ownerSnap = await FirebaseFirestore.instance
+                .collection('users')
+                .doc(uid)
+                .get();
+            final ownerData = ownerSnap.data() ?? {};
+            final missing = <String>[
+              if (ownerData['orgType'] != _type) 'orgType',
+              if (ownerData['clinicId'] != clinicId) 'clinicId',
+              if (ownerData['role'] != 'owner') 'role',
+              if (ownerData['isDoctor'] != effectiveIsDoctor)
+                'isDoctor',
+              if (ownerData['isLabOwner'] != (_type == 'lab'))
+                'isLabOwner',
+              if (ownerData['active'] != true) 'active',
+            ];
+
+            debugPrint('createClinic: owner linked uid=$uid '
+                'clinic=$clinicId orgType=$_type '
+                'isDoctor=$effectiveIsDoctor '
+                'isLabOwner=${_type == 'lab'} '
+                'missing=${missing.isEmpty ? "none" : missing.join(",")}');
+
+            ownerAttachMessage = missing.isEmpty
+                ? 'Owner account linked.'
+                : 'Owner link partially failed. Missing on user doc: '
+                    '${missing.join(", ")}. Check Firestore rules.';
+          } catch (e) {
+            debugPrint('createClinic: attachClinicToUser FAILED '
+                'uid=$uid clinic=$clinicId orgType=$_type '
+                'isDoctor=$effectiveIsDoctor error=$e');
+            ownerAttachMessage =
+                '${_type == 'lab' ? 'Lab' : 'Clinic'} created, but '
+                'owner link failed: $e';
+          }
         }
       }
 
@@ -365,9 +422,6 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
     );
   }
 
-  // -----------------------------------------------------------------
-  // Type selector
-  // -----------------------------------------------------------------
   Widget _sectionType() {
     return FormSection(
       title: 'Entity Type',
@@ -405,7 +459,12 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
   }) {
     final selected = _type == value;
     return GestureDetector(
-      onTap: () => setState(() => _type = value),
+      onTap: () => setState(() {
+        _type = value;
+        // Reset the lab-specific toggle when switching entity type —
+        // it's only meaningful for labs.
+        if (value != 'lab') _ownerIsDoctor = false;
+      }),
       child: Container(
         padding: const EdgeInsets.all(14),
         decoration: BoxDecoration(
@@ -442,9 +501,6 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
     );
   }
 
-  // -----------------------------------------------------------------
-  // Identity (labels switch by type)
-  // -----------------------------------------------------------------
   Widget _sectionIdentity() {
     final isLab = _type == 'lab';
     return FormSection(
@@ -524,9 +580,6 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
     );
   }
 
-  // -----------------------------------------------------------------
-  // Contact
-  // -----------------------------------------------------------------
   Widget _sectionContact() {
     return FormSection(
       title: 'Contact',
@@ -586,9 +639,6 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
     );
   }
 
-  // -----------------------------------------------------------------
-  // Address
-  // -----------------------------------------------------------------
   Widget _sectionAddress() {
     return FormSection(
       title: 'Address',
@@ -613,72 +663,65 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
             hint: 'Landmark (optional)',
           ),
         ),
-        Row(
-          children: [
-            Expanded(
-              child: LabeledField(
-                label: 'Area',
-                child: DarkTextField(
-                  controller: _area,
-                  hint: 'Indiranagar',
-                ),
+        Row(children: [
+          Expanded(
+            child: LabeledField(
+              label: 'Area',
+              child: DarkTextField(
+                controller: _area,
+                hint: 'Indiranagar',
               ),
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: LabeledField(
-                label: 'Pincode',
-                required: true,
-                child: DarkTextField(
-                  controller: _pincode,
-                  hint: '560001',
-                  keyboardType: TextInputType.number,
-                  validator: (v) => (v == null || v.trim().isEmpty)
-                      ? 'Required'
-                      : null,
-                ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: LabeledField(
+              label: 'Pincode',
+              required: true,
+              child: DarkTextField(
+                controller: _pincode,
+                hint: '560001',
+                keyboardType: TextInputType.number,
+                validator: (v) => (v == null || v.trim().isEmpty)
+                    ? 'Required'
+                    : null,
               ),
             ),
-          ],
-        ),
-        Row(
-          children: [
-            Expanded(
-              child: LabeledField(
-                label: 'City',
-                required: true,
-                child: DarkTextField(
-                  controller: _city,
-                  hint: 'Bengaluru',
-                  validator: (v) => (v == null || v.trim().isEmpty)
-                      ? 'Required'
-                      : null,
-                ),
+          ),
+        ]),
+        Row(children: [
+          Expanded(
+            child: LabeledField(
+              label: 'City',
+              required: true,
+              child: DarkTextField(
+                controller: _city,
+                hint: 'Bengaluru',
+                validator: (v) => (v == null || v.trim().isEmpty)
+                    ? 'Required'
+                    : null,
               ),
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: LabeledField(
-                label: 'State',
-                required: true,
-                child: DarkTextField(
-                  controller: _state,
-                  hint: 'Karnataka',
-                  validator: (v) => (v == null || v.trim().isEmpty)
-                      ? 'Required'
-                      : null,
-                ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: LabeledField(
+              label: 'State',
+              required: true,
+              child: DarkTextField(
+                controller: _state,
+                hint: 'Karnataka',
+                validator: (v) => (v == null || v.trim().isEmpty)
+                    ? 'Required'
+                    : null,
               ),
             ),
-          ],
-        ),
+          ),
+        ]),
       ],
     );
   }
 
-  // -----------------------------------------------------------------
-  // Registration
-  // -----------------------------------------------------------------
   Widget _sectionRegistration() {
     return FormSection(
       title: 'Registration & Compliance',
@@ -722,9 +765,6 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
     );
   }
 
-  // -----------------------------------------------------------------
-  // Financial (clinic only)
-  // -----------------------------------------------------------------
   Widget _sectionFinancial() {
     return FormSection(
       title: 'Fees & Payment',
@@ -732,52 +772,48 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
       accent: AppColors.accent,
       initiallyExpanded: false,
       children: [
-        Row(
-          children: [
-            Expanded(
-              child: LabeledField(
-                label: 'Consultation Fee (₹)',
-                child: DarkTextField(
-                  controller: _consultationFee,
-                  keyboardType: TextInputType.number,
-                ),
+        Row(children: [
+          Expanded(
+            child: LabeledField(
+              label: 'Consultation Fee (₹)',
+              child: DarkTextField(
+                controller: _consultationFee,
+                keyboardType: TextInputType.number,
               ),
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: LabeledField(
-                label: 'Follow-up Fee (₹)',
-                child: DarkTextField(
-                  controller: _followUpFee,
-                  keyboardType: TextInputType.number,
-                ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: LabeledField(
+              label: 'Follow-up Fee (₹)',
+              child: DarkTextField(
+                controller: _followUpFee,
+                keyboardType: TextInputType.number,
               ),
             ),
-          ],
-        ),
-        Row(
-          children: [
-            Expanded(
-              child: LabeledField(
-                label: 'Teleconsult Fee (₹)',
-                child: DarkTextField(
-                  controller: _teleconsultFee,
-                  keyboardType: TextInputType.number,
-                ),
+          ),
+        ]),
+        Row(children: [
+          Expanded(
+            child: LabeledField(
+              label: 'Teleconsult Fee (₹)',
+              child: DarkTextField(
+                controller: _teleconsultFee,
+                keyboardType: TextInputType.number,
               ),
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: LabeledField(
-                label: 'UPI ID',
-                child: DarkTextField(
-                  controller: _upiId,
-                  hint: 'clinic@okhdfc',
-                ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: LabeledField(
+              label: 'UPI ID',
+              child: DarkTextField(
+                controller: _upiId,
+                hint: 'clinic@okhdfc',
               ),
             ),
-          ],
-        ),
+          ),
+        ]),
         LabeledField(
           label: 'Payment Methods',
           child: TagInput(
@@ -803,9 +839,6 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
     );
   }
 
-  // -----------------------------------------------------------------
-  // Appointment defaults (clinic only)
-  // -----------------------------------------------------------------
   Widget _sectionAppointments() {
     return FormSection(
       title: 'Appointment Defaults',
@@ -813,52 +846,48 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
       accent: AppColors.receptionAccent,
       initiallyExpanded: false,
       children: [
-        Row(
-          children: [
-            Expanded(
-              child: LabeledField(
-                label: 'Slot Duration (min)',
-                child: DarkTextField(
-                  controller: _slotDuration,
-                  keyboardType: TextInputType.number,
-                ),
+        Row(children: [
+          Expanded(
+            child: LabeledField(
+              label: 'Slot Duration (min)',
+              child: DarkTextField(
+                controller: _slotDuration,
+                keyboardType: TextInputType.number,
               ),
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: LabeledField(
-                label: 'Max Advance (days)',
-                child: DarkTextField(
-                  controller: _maxAdvanceDays,
-                  keyboardType: TextInputType.number,
-                ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: LabeledField(
+              label: 'Max Advance (days)',
+              child: DarkTextField(
+                controller: _maxAdvanceDays,
+                keyboardType: TextInputType.number,
               ),
             ),
-          ],
-        ),
-        Row(
-          children: [
-            Expanded(
-              child: LabeledField(
-                label: 'Confirm Window (hrs)',
-                child: DarkTextField(
-                  controller: _confirmationWindow,
-                  keyboardType: TextInputType.number,
-                ),
+          ),
+        ]),
+        Row(children: [
+          Expanded(
+            child: LabeledField(
+              label: 'Confirm Window (hrs)',
+              child: DarkTextField(
+                controller: _confirmationWindow,
+                keyboardType: TextInputType.number,
               ),
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: LabeledField(
-                label: 'Token Prefix',
-                child: DarkTextField(
-                  controller: _tokenPrefix,
-                  hint: 'A',
-                ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: LabeledField(
+              label: 'Token Prefix',
+              child: DarkTextField(
+                controller: _tokenPrefix,
+                hint: 'A',
               ),
             ),
-          ],
-        ),
+          ),
+        ]),
         SwitchListTile(
           value: _whatsappEnabled,
           onChanged: (v) => setState(() => _whatsappEnabled = v),
@@ -871,9 +900,6 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
     );
   }
 
-  // -----------------------------------------------------------------
-  // Owner (optional linking)
-  // -----------------------------------------------------------------
   Widget _sectionOwner() {
     return FormSection(
       title: 'Owner / Staff (optional)',
@@ -884,7 +910,8 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
         Padding(
           padding: const EdgeInsets.only(bottom: 12),
           child: Text(
-            'The owner must have already signed up. Enter their email to link them to this ${_type == 'lab' ? 'lab' : 'clinic'}.',
+            'The owner must have already signed up. Enter their email to '
+            'link them to this ${_type == 'lab' ? 'lab' : 'clinic'}.',
             style:
                 const TextStyle(color: AppColors.textMuted, fontSize: 12),
           ),
@@ -915,13 +942,36 @@ class _CreateClinicScreenState extends ConsumerState<CreateClinicScreen> {
             icon: Icons.phone_outlined,
           ),
         ),
+        // Owner-as-doctor toggle — only meaningful for labs.
+        // For clinics, the owner is assumed to be a doctor already.
+        if (_type == 'lab')
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: SwitchListTile(
+              value: _ownerIsDoctor,
+              onChanged: (v) => setState(() => _ownerIsDoctor = v),
+              activeThumbColor: AppColors.primary,
+              title: const Text(
+                'Owner also practises as a doctor',
+                style: TextStyle(color: AppColors.textPrimary),
+              ),
+              subtitle: const Text(
+                'Enable if the owner is also a consulting doctor. '
+                'They will be able to open the doctor dashboard from '
+                'their owner dashboard.',
+                style: TextStyle(
+                  color: AppColors.textMuted,
+                  fontSize: 12,
+                  height: 1.35,
+                ),
+              ),
+              contentPadding: EdgeInsets.zero,
+            ),
+          ),
       ],
     );
   }
 
-  // -----------------------------------------------------------------
-  // Subscription (clinic only)
-  // -----------------------------------------------------------------
   Widget _sectionPlan() {
     return FormSection(
       title: 'Subscription',

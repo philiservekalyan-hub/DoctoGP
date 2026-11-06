@@ -8,8 +8,7 @@ import '../../../app/theme/app_text_styles.dart';
 import '../../../core/widgets/empty_state.dart';
 import '../../../core/widgets/glass_card.dart';
 import '../../../shared/widgets/clinic_app_bar.dart';
-import 'add_staff_screen.dart';
-
+import '../../staff/presentation/add_staff_screen.dart';
 final teamProvider =
     StreamProvider.autoDispose<List<Map<String, dynamic>>>((ref) async* {
   final me = await ref.watch(currentUserProvider.future);

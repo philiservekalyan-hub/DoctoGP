@@ -31,7 +31,7 @@ class ClinicAppBar extends ConsumerWidget implements PreferredSizeWidget {
     final clinicAsync = ref.watch(currentClinicProvider);
 
     final clinicName = user?.role == UserRole.admin
-    ? 'DoctoGP Admin'
+    ? 'STAT Admin'
     : clinicAsync.maybeWhen(
         data: (c) => c?.name ?? 'Clinic',
         orElse: () => 'Clinic',

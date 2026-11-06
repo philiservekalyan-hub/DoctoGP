@@ -199,7 +199,7 @@ class _LabOrderCreateScreenState
         return;
       }
 
-           await ref.read(labServiceProvider).createOrder(
+      await ref.read(labServiceProvider).createOrder(
             referringClinicId: user.clinicId!,
             labClinicId: _labClinicId!,
             labName: _labName,
@@ -207,6 +207,12 @@ class _LabOrderCreateScreenState
             patientId: _patient!.patientId,
             patientName: _patient!.fullName,
             patientPhone: _patient!.phone,
+            patientEmail: _patient!.email,
+            patientGender: _patient!.gender,
+            patientDob: _patient!.dob,
+            patientBloodGroup: _patient!.bloodGroup,
+            referringClinicName: user.clinicName,
+            referringClinicPatientDocId: _patient!.docId,
             doctorDocId: user.uid,
             doctorName: user.name,
             tests: tests,
@@ -217,7 +223,7 @@ class _LabOrderCreateScreenState
                 ? null
                 : _notesCtrl.text.trim(),
             appointmentId: widget.preselectedAppointmentId,
-            billableAmount: null, // reception sets at the desk
+            billableAmount: null,
           );
 
       _snack('Lab order sent.', AppColors.success);
@@ -484,20 +490,30 @@ class _LabOrderCreateScreenState
 // -----------------------------------------------------------------
 typedef _LabsForTestsKey = ({String clinicId, String testKeysCsv});
 
-String _canonTestKey(String code, String name) {
-  String norm(String s) => s
+/// Canonical key — normalized CODE only. Mirrors
+/// `canonicalTestKey` in `lab_test_picker_sheet.dart` so both sides
+/// of the match use the same string.
+String _canonTestKey(String code) {
+  return code
       .replaceAll('\u00A0', ' ')
       .trim()
       .toLowerCase()
       .replaceAll(RegExp(r'\s+'), ' ');
-  return '${norm(code)}__${norm(name)}';
 }
 
 final _labsForTestsProvider = FutureProvider.autoDispose
     .family<List<Map<String, dynamic>>, _LabsForTestsKey>((ref, key) async {
-  final testKeys = key.testKeysCsv.isEmpty
+  // testKeysCsv is a '|'-joined list of AggregatedTest.key values.
+  // By contract, AggregatedTest.key == normalized test CODE.
+  final testCodes = key.testKeysCsv.isEmpty
       ? const <String>[]
-      : key.testKeysCsv.split('|');
+      : key.testKeysCsv
+          .split('|')
+          .map(_canonTestKey)
+          .where((s) => s.isNotEmpty)
+          .toList();
+
+  if (testCodes.isEmpty) return const <Map<String, dynamic>>[];
 
   final catalogs = await ref
       .read(labServiceProvider)
@@ -514,23 +530,21 @@ final _labsForTestsProvider = FutureProvider.autoDispose
     };
     for (final raw in lab.tests) {
       if (raw is! Map) continue;
-      final code = (raw['code'] ?? '').toString();
-      final name = (raw['name'] ?? '').toString();
-      final ck = _canonTestKey(code, name);
+      final code = (raw['code'] ?? raw['localCode'] ?? '').toString();
+      if (code.isEmpty) continue;
+      final ck = _canonTestKey(code);
       offerings.putIfAbsent(ck, () => <String>{}).add(lab.labClinicId);
     }
   }
 
+  // Labs that offer ALL selected codes.
   Set<String>? intersection;
-  for (final k in testKeys) {
-    final i = k.indexOf('_');
-    final canon = i < 0
-        ? _canonTestKey(k, '')
-        : _canonTestKey(k.substring(0, i), k.substring(i + 1));
-    final labs = offerings[canon] ?? const <String>{};
+  for (final code in testCodes) {
+    final labs = offerings[code] ?? const <String>{};
     intersection = intersection == null
         ? {...labs}
         : intersection.intersection(labs);
+    if (intersection.isEmpty) break;
   }
 
   final result = <Map<String, dynamic>>[];
@@ -556,8 +570,7 @@ class _PatientPickerScreen extends ConsumerStatefulWidget {
       _PatientPickerScreenState();
 }
 
-class _PatientPickerScreenState
-    extends ConsumerState<_PatientPickerScreen> {
+class _PatientPickerScreenState extends ConsumerState<_PatientPickerScreen> {
   final _search = TextEditingController();
   String _q = '';
 

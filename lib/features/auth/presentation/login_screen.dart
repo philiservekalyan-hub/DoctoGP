@@ -1,5 +1,6 @@
 // lib/features/auth/presentation/login_screen.dart
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -53,6 +54,23 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
         return;
       }
 
+      // ── Deactivated account check ──
+      // The user doc carries `active`. When the lab owner (or any
+      // clinic admin) deactivates a member from the Team screen, that
+      // field flips to false. We refuse the sign-in here rather than
+      // let them reach a dashboard that will fail every write.
+      if (user.active == false) {
+        try {
+          await FirebaseAuth.instance.signOut();
+        } catch (e) {
+          debugPrint('[Login] signOut after deactivation failed: $e');
+        }
+        if (!mounted) return;
+        setState(() => _error =
+            'Your account has been deactivated. Contact your administrator.');
+        return;
+      }
+
       debugPrint('[Login] Role = ${user.role} (${user.roleLabel}), '
           'orgType = ${user.orgType}');
 
@@ -76,8 +94,23 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
     switch (user.role) {
       case UserRole.patient:
         return '/patient';
-      case UserRole.owner:
+          case UserRole.owner:
+      if (user.orgType == 'lab') return '/lab';
+      if (user.orgType == 'clinic') return '/owner';
+      if (user.clinicId == null || user.clinicId!.isEmpty) {
         return '/owner';
+      }
+      try {
+        final org = await FirebaseFirestore.instance
+            .collection('clinics')
+            .doc(user.clinicId)
+            .get();
+        final type = org.data()?['type'];
+        if (type == 'lab') return '/lab';
+      } catch (e) {
+        debugPrint('[Login] orgType lookup failed: $e');
+      }
+      return '/owner';
       case UserRole.doctor:
         return '/doctor';
       case UserRole.nurse:
@@ -122,17 +155,24 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const SizedBox(height: 30),
-                Container(
-                  width: 60,
-                  height: 60,
-                  decoration: BoxDecoration(
-                    gradient: AppColors.primaryGradient,
-                    borderRadius: BorderRadius.circular(18),
-                  ),
-                  child: const Icon(Icons.medical_services_rounded,
-                      color: AppColors.background, size: 30),
-                ),
-                const SizedBox(height: 28),
+Center(
+  child: Image.asset(
+    'assets/images/logo.png',
+    height: 120,
+    fit: BoxFit.contain,
+    errorBuilder: (_, __, ___) => Container(
+      width: 200,
+      height: 120,
+      decoration: BoxDecoration(
+        gradient: AppColors.primaryGradient,
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: const Icon(Icons.medical_services_rounded,
+          color: AppColors.background, size: 30),
+    ),
+  ),
+),
+const SizedBox(height: 28),
                 Text('Welcome back', style: AppTextStyles.h1),
                 const SizedBox(height: 8),
                 Text('Sign in to your clinic account',

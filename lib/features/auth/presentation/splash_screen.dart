@@ -1,5 +1,6 @@
 // lib/features/auth/presentation/splash_screen.dart
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -26,34 +27,44 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
   }
 
   Future<void> _boot() async {
-    debugPrint('[Splash] Boot starting...');
+    debugPrint('[Splash] boot start');
 
+    // Minimum display time so the logo is visible even when auth
+    // resolves instantly. Set to 2000ms for a noticeable splash.
+    final minimumHold = Future.delayed(const Duration(milliseconds: 2000));
+
+    UserModel? user;
     try {
-      final user = await ref
-          .read(authServiceProvider)
-          .currentUserModel()
-          .timeout(
-            const Duration(seconds: 8),
-            onTimeout: () {
-              debugPrint('[Splash] Firestore timeout');
-              return null;
-            },
-          );
-
-      debugPrint('[Splash] user = $user');
-
-      if (!mounted) return;
-
-      if (user == null) {
-        _navigate('/login');
-      } else {
-        final path = await _landingFor(user);
-        _navigate(path);
-      }
-    } catch (e, st) {
-      debugPrint('[Splash] Error: $e\n$st');
-      if (mounted) _navigate('/login');
+      user = await ref
+          .read(currentUserProvider.future)
+          .timeout(const Duration(seconds: 8));
+    } catch (e) {
+      debugPrint('[Splash] boot error: $e');
+      user = null;
     }
+
+    await minimumHold;
+
+    debugPrint('[Splash] user=$user');
+    if (!mounted) return;
+
+    if (user == null) {
+      _navigate('/login');
+      return;
+    }
+    if (user.active == false) {
+      try {
+        await FirebaseAuth.instance.signOut();
+      } catch (e) {
+        debugPrint('[Splash] signOut after deactivation failed: $e');
+      }
+      if (mounted) _navigate('/login');
+      return;
+    }
+
+    final path = await _landingFor(user);
+    if (!mounted) return;
+    _navigate(path);
   }
 
   void _navigate(String path) {
@@ -66,15 +77,21 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
     });
   }
 
-  /// Landing route for a signed-in user. Receptionists consult
-  /// `orgType` (fast path) or the clinics/{clinicId}.type field
-  /// (slow path) to distinguish lab reception from clinic
-  /// reception.
   Future<String> _landingFor(UserModel user) async {
     switch (user.role) {
       case UserRole.patient:
         return '/patient';
       case UserRole.owner:
+        if (user.orgType == 'lab') return '/lab';
+        if (user.orgType == 'clinic') return '/owner';
+        if (user.clinicId == null || user.clinicId!.isEmpty) return '/owner';
+        try {
+          final org = await FirebaseFirestore.instance
+              .collection('clinics')
+              .doc(user.clinicId)
+              .get();
+          if (org.data()?['type'] == 'lab') return '/lab';
+        } catch (_) {}
         return '/owner';
       case UserRole.doctor:
         return '/doctor';
@@ -85,11 +102,8 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
       case UserRole.admin:
         return '/admin';
       case UserRole.receptionist:
-        // Fast path — orgType denormalized onto the user doc.
         if (user.orgType == 'lab') return '/lab-reception';
         if (user.orgType == 'clinic') return '/reception';
-
-        // Slow path — read once from the clinics doc.
         if (user.clinicId == null || user.clinicId!.isEmpty) {
           return '/reception';
         }
@@ -98,13 +112,9 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
               .collection('clinics')
               .doc(user.clinicId)
               .get();
-          final type = org.data()?['type'];
-          if (type == 'lab') return '/lab-reception';
-        } catch (e) {
-          debugPrint('[Splash] orgType lookup failed: $e');
-        }
+          if (org.data()?['type'] == 'lab') return '/lab-reception';
+        } catch (_) {}
         return '/reception';
-
       default:
         return '/login';
     }
@@ -115,38 +125,51 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
     return Scaffold(
       body: Container(
         decoration: const BoxDecoration(gradient: AppColors.bgGradient),
-        child: Center(
+        child: SafeArea(
           child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Container(
-                width: 90,
-                height: 90,
-                decoration: BoxDecoration(
-                  gradient: AppColors.primaryGradient,
-                  borderRadius: BorderRadius.circular(24),
-                  boxShadow: [
-                    BoxShadow(
-                      color: AppColors.primary.withOpacity(0.4),
-                      blurRadius: 40,
-                      spreadRadius: 2,
-                    ),
-                  ],
+              const Spacer(),
+              Image.asset(
+                'assets/images/logo.png',
+                height: 320,
+                fit: BoxFit.contain,
+                errorBuilder: (_, __, ___) => const Icon(
+                  Icons.medical_services_rounded,
+                  color: AppColors.primary,
+                  size: 160,
                 ),
-                child: const Icon(Icons.medical_services_rounded,
-                    color: AppColors.background, size: 44),
               ),
-              const SizedBox(height: 24),
-              Text('DoctoGP', style: AppTextStyles.h1),
+              const SizedBox(height: 32),
+              Text('STAT', style: AppTextStyles.h1),
               const SizedBox(height: 8),
               Text('Connected Care Platform',
                   style: AppTextStyles.bodyMuted),
-              const SizedBox(height: 40),
-              const SizedBox(
-                height: 24,
-                width: 24,
-                child: CircularProgressIndicator(
-                    strokeWidth: 2, color: AppColors.primary),
+              const Spacer(),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(48, 0, 48, 48),
+                child: Column(
+                  children: [
+                    SizedBox(
+                      height: 4,
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(4),
+                        child: const LinearProgressIndicator(
+                          minHeight: 4,
+                          backgroundColor: AppColors.cardBorder,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            AppColors.primary,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      'Preparing your workspace…',
+                      style: AppTextStyles.caption
+                          .copyWith(color: AppColors.textMuted),
+                    ),
+                  ],
+                ),
               ),
             ],
           ),

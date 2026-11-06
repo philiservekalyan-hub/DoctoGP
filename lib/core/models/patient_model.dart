@@ -1,8 +1,8 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 
 class PatientModel {
-  final String docId;           // Firestore internal ID (never shown in UI)
-  final String patientId;       // Human-readable: PT-2026-0001
+  final String docId;
+  final String patientId;
   final String fullName;
   final String phone;
   final String? email;
@@ -41,6 +41,13 @@ class PatientModel {
   final String? createdByUserId;
   final bool active;
 
+  // Lab linkage — set when this patient record adopts an existing
+  // labCustomers record (scenario 3). Null for pure clinic-originated
+  // patients.
+  final String? linkedLabCustomerDocId;
+  final String? linkedLabClinicId;
+  final List<String> linkedLabCustomerDocIds;
+
   final DateTime? createdAt;
   final DateTime? updatedAt;
 
@@ -78,13 +85,22 @@ class PatientModel {
     this.primaryDoctorName,
     this.createdByUserId,
     this.active = true,
+    this.linkedLabCustomerDocId,
+    this.linkedLabClinicId,
+    this.linkedLabCustomerDocIds = const [],
     this.createdAt,
     this.updatedAt,
   });
 
+  bool get isLabAdopted => linkedLabCustomerDocId != null;
+
+  /// Lowercased full name — used for case-insensitive prefix search.
+  String get fullNameLower => fullName.trim().toLowerCase();
+
   Map<String, dynamic> toMap() => {
         'patientId': patientId,
         'fullName': fullName,
+        'nameLower': fullNameLower,
         'phone': phone,
         'email': email,
         'gender': gender,
@@ -115,6 +131,9 @@ class PatientModel {
         'primaryDoctorName': primaryDoctorName,
         'createdByUserId': createdByUserId,
         'active': active,
+        'linkedLabCustomerDocId': linkedLabCustomerDocId,
+        'linkedLabClinicId': linkedLabClinicId,
+        'linkedLabCustomerDocIds': linkedLabCustomerDocIds,
         'createdAt': createdAt != null
             ? Timestamp.fromDate(createdAt!)
             : FieldValue.serverTimestamp(),
@@ -171,6 +190,12 @@ class PatientModel {
       primaryDoctorName: map['primaryDoctorName'],
       createdByUserId: map['createdByUserId'],
       active: _parseBool(map['active'], defaultVal: true),
+      linkedLabCustomerDocId: map['linkedLabCustomerDocId']?.toString(),
+      linkedLabClinicId: map['linkedLabClinicId']?.toString(),
+      linkedLabCustomerDocIds: ((map['linkedLabCustomerDocIds'] as List?) ??
+              const [])
+          .map((e) => e.toString())
+          .toList(),
       createdAt: parse(map['createdAt']),
       updatedAt: parse(map['updatedAt']),
     );

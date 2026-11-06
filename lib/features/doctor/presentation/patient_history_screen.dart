@@ -238,16 +238,20 @@ class PatientHistoryScreen extends ConsumerWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(children: [
+                    Row(children: [
             const Icon(Icons.event_note_rounded,
                 size: 18, color: AppColors.info),
             const SizedBox(width: 8),
-            Text(
-              DateFormat('EEE, dd MMM yyyy • hh:mm a').format(when),
-              style: AppTextStyles.caption,
+            Expanded(
+              child: Text(
+                DateFormat('EEE, dd MMM yyyy • hh:mm a').format(when),
+                style: AppTextStyles.caption,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
             ),
-            const Spacer(),
-            if (disp != null)
+            if (disp != null) ...[
+              const SizedBox(width: 8),
               Container(
                 padding: const EdgeInsets.symmetric(
                     horizontal: 8, vertical: 3),
@@ -262,7 +266,9 @@ class PatientHistoryScreen extends ConsumerWidget {
                       fontWeight: FontWeight.w600),
                 ),
               ),
+            ],
           ]),
+
           if (visit?.consultationFees != null) ...[
             const SizedBox(height: 8),
             Container(
@@ -552,23 +558,31 @@ class PatientHistoryScreen extends ConsumerWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Row(children: [
-                      Text(
-                        DateFormat('dd MMM yyyy • hh:mm a')
-                            .format(e.when),
-                        style: AppTextStyles.caption,
+                                       Row(children: [
+                      Expanded(
+                        child: Text(
+                          DateFormat('dd MMM yyyy • hh:mm a')
+                              .format(e.when),
+                          style: AppTextStyles.caption,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
                       ),
-                      const Spacer(),
                       if (disp != null) ...[
-                        Text(
-                          disp.label,
-                          style: AppTextStyles.caption.copyWith(
-                            color: AppColors.doctorAccent,
-                            fontWeight: FontWeight.w600,
+                        const SizedBox(width: 8),
+                        Flexible(
+                          child: Text(
+                            disp.label,
+                            style: AppTextStyles.caption.copyWith(
+                              color: AppColors.doctorAccent,
+                              fontWeight: FontWeight.w600,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
                           ),
                         ),
-                        const SizedBox(width: 8),
                       ],
+                      const SizedBox(width: 8),
                       Text(
                         isConsult ? 'Consult' : 'Visit',
                         style: AppTextStyles.caption.copyWith(

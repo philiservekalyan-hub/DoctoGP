@@ -7,6 +7,21 @@ import '../../../app/theme/app_text_styles.dart';
 import '../../../core/providers/service_providers.dart';
 import '../../../core/widgets/glass_card.dart';
 
+/// Canonical key for a test — normalized CODE only.
+///
+/// Codes are unique in `/tests` (enforced by `codeLower`), and
+/// unlike names they don't change when an admin renames a test.
+/// Using code alone keeps the key stable across edits and lets
+/// other screens (`_labsForTestsProvider`) match offerings without
+/// needing to parse the key.
+String canonicalTestKey(String code) {
+  return code
+      .replaceAll('\u00A0', ' ')
+      .trim()
+      .toLowerCase()
+      .replaceAll(RegExp(r'\s+'), ' ');
+}
+
 class AggregatedTest {
   final String code;
   final String name;
@@ -28,7 +43,9 @@ class AggregatedTest {
     required this.offeringLabNames,
   });
 
-  String get key => '${code}_$name';
+  /// Stable identity — normalized code.
+  String get key => canonicalTestKey(code);
+
   String get display => code.isEmpty ? name : '$code — $name';
 }
 
@@ -46,8 +63,7 @@ class LabTestPickerSheet extends ConsumerStatefulWidget {
       _LabTestPickerSheetState();
 }
 
-class _LabTestPickerSheetState
-    extends ConsumerState<LabTestPickerSheet> {
+class _LabTestPickerSheetState extends ConsumerState<LabTestPickerSheet> {
   final _searchCtrl = TextEditingController();
   String _query = '';
   final Set<String> _selectedKeys = {};
@@ -75,18 +91,26 @@ class _LabTestPickerSheetState
       for (final lab in catalogs) {
         for (final raw in lab.tests) {
           if (raw is! Map) continue;
-          final code = (raw['code'] ?? '').toString();
-          final name = (raw['name'] ?? '').toString();
-          if (code.isEmpty && name.isEmpty) continue;
 
-          final key = '${code}_$name';
+          // Canonical offerings carry `code`; lab-local offerings
+          // carry `localCode`. Fall back to whichever is present.
+          final rawCode =
+              (raw['code'] ?? raw['localCode'] ?? '').toString();
+          final name =
+              (raw['name'] ?? raw['localName'] ?? '').toString();
+
+          final key = canonicalTestKey(rawCode);
+          if (key.isEmpty) continue;
+
           final existing = grouped[key];
           if (existing != null) {
-            existing.offeringLabIds.add(lab.labClinicId);
-            existing.offeringLabNames.add(lab.labName);
+            if (!existing.offeringLabIds.contains(lab.labClinicId)) {
+              existing.offeringLabIds.add(lab.labClinicId);
+              existing.offeringLabNames.add(lab.labName);
+            }
           } else {
             grouped[key] = AggregatedTest(
-              code: code,
+              code: rawCode,
               name: name,
               category: (raw['category'] ?? 'Other').toString(),
               sampleType: (raw['sampleType'] ?? 'Blood').toString(),

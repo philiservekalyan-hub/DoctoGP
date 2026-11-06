@@ -8,6 +8,7 @@ import 'doctor_dashboard.dart';
 import 'doctor_providers.dart';
 import 'lab_order_history_screen.dart';
 import 'lab_orders_screen.dart';
+import 'consult_tab.dart';
 
 class DoctorShell extends ConsumerWidget {
   const DoctorShell({super.key});
@@ -102,7 +103,7 @@ class _ConsultTabHost extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final appt = ref.watch(selectedAppointmentProvider);
-    if (appt == null) return const ConsultationScreen();
+    if (appt == null) return const ConsultTab();
     return ConsultationScreen(
       key: ValueKey(appt.docId),
       appointment: appt,

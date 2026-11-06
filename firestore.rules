@@ -284,66 +284,186 @@ service cloud.firestore {
       allow read, write: if isStaff();
     }
 
-    // =================================================================
+       // =================================================================
     // CLINICS & LABS (single collection, distinguished by `type`)
     // =================================================================
-   match /clinics/{clinicId} {
-  allow read: if isSignedIn();
-  allow read: if isSignedIn()
-              && resource.data.ownerEmail == request.auth.token.email;
+    match /clinics/{clinicId} {
+      allow read: if isSignedIn();
+      allow read: if isSignedIn()
+                  && resource.data.ownerEmail == request.auth.token.email;
 
-  allow create: if isAdmin();
-  allow delete: if isAdmin();
+      allow create: if isAdmin();
+      allow delete: if isAdmin();
 
-  // Receptionist, admin, or owner can edit clinic details.
-  allow update: if isSignedIn()
-    && (isReceptionist() || isClinicAdmin());
+      // Receptionist, admin, or owner can edit clinic details.
+      allow update: if isSignedIn()
+        && (isReceptionist() || isClinicAdmin());
 
-  //  NEW — Owner self-claim during signup (no role claim yet).
-  allow update: if isSignedIn()
-    && resource.data.ownerEmail == request.auth.token.email
-    && onlyChanged(['ownerUserId', 'ownerClaimedAt', 'updatedAt']);
+      // Owner self-claim during signup (no role claim yet).
+      allow update: if isSignedIn()
+        && resource.data.ownerEmail == request.auth.token.email
+        && onlyChanged(['ownerUserId', 'ownerClaimedAt', 'updatedAt']);
 
-  // ----- Subcollection: two-sided links -----
-  match /linkedLabs/{labClinicId} {
-    allow read: if isSignedIn();
-    allow create, update, delete: if isAdmin();
-  }
+      // ----- Subcollection: two-sided links -----
+      match /linkedLabs/{labClinicId} {
+        allow read: if isSignedIn();
+        allow create, update, delete: if isAdmin();
+      }
 
-  match /linkedClinics/{otherClinicId} {
-    allow read: if isSignedIn();
-    allow create, update, delete: if isAdmin();
-  }
+      match /linkedClinics/{otherClinicId} {
+        allow read: if isSignedIn();
+        allow create, update, delete: if isAdmin();
+      }
 
-  match /labTests/{testId} {
-    allow read: if isSignedIn();
-    allow write: if isSignedIn()
-      && (
-        isAdmin()
-        || isClinicAdmin()
-        || (isLab() && clinicId == myClinicId())
-      );
-  }
+      // ----- Subcollection: lab test offerings -----
+      //
+      // Two doc shapes live here:
+      //   • Canonical offering: testId != null, isLocal == false
+      //   • Local test:        testId == null, isLocal == true
+      //
+      // Both must carry mrp > 0 and offerPrice > 0 with
+      // offerPrice <= mrp. Neither can carry canonical clinical
+      // fields (code/name/category/sampleType/fastingRequired/
+      // loincCode) — those belong only in /tests/.
+      match /labTests/{testId} {
+        allow read: if isSignedIn();
 
-  match /catalog/{docId} {
-    allow read: if isSignedIn();
-    allow write: if isSignedIn()
-      && (
-        isAdmin()
-        || (isLab() && clinicId == myClinicId())
-      );
-  }
+        allow create: if isSignedIn()
+          && (isAdmin() || (isClinicAdmin() && clinicId == myClinicId()))
+          // Cannot introduce canonical clinical fields
+          && !request.resource.data.keys().hasAny([
+               'code', 'name', 'category', 'sampleType',
+               'fastingRequired', 'loincCode'
+             ])
+          // Canonical OR local — never both shapes
+          && (
+            // Canonical offering
+            (request.resource.data.isLocal == false
+              && request.resource.data.testId is string
+              && request.resource.data.testId.size() > 0
+              && existsAfter(
+                   /databases/$(database)/documents/tests/$(request.resource.data.testId)
+                 ))
+            ||
+            // Local test
+            (request.resource.data.isLocal == true
+              && (!('testId' in request.resource.data.keys())
+                  || request.resource.data.testId == null)
+              && request.resource.data.localCode is string
+              && request.resource.data.localCode.matches('^[A-Z0-9_]{2,12}$')
+              && request.resource.data.localName is string
+              && request.resource.data.localName.size() >= 3)
+          )
+          // Pricing invariants
+          && request.resource.data.mrp is number
+          && request.resource.data.mrp > 0
+          && request.resource.data.offerPrice is number
+          && request.resource.data.offerPrice > 0
+          && request.resource.data.offerPrice <= request.resource.data.mrp;
 
-  match /departments/{deptId} {
-    allow read: if isSignedIn();
-    allow write: if isSignedIn()
-      && (
-        isAdmin()
-        || isClinicAdmin()
-        || (isLab() && clinicId == myClinicId())
-      );
-  }
-}
+        allow update: if isSignedIn()
+          && (isAdmin()
+              || (isClinicAdmin() && clinicId == myClinicId())
+              || (isLab() && clinicId == myClinicId()))
+          // testId and isLocal are immutable
+          && (
+               !('testId' in request.resource.data.diff(resource.data).affectedKeys())
+               || request.resource.data.testId == resource.data.testId
+             )
+          && (
+               !('isLocal' in request.resource.data.diff(resource.data).affectedKeys())
+               || request.resource.data.isLocal == resource.data.isLocal
+             )
+          // Cannot inject canonical clinical fields via update
+          && !request.resource.data
+                .diff(resource.data)
+                .affectedKeys()
+                .hasAny(['code', 'name', 'category', 'sampleType',
+                         'fastingRequired', 'loincCode'])
+          // If price fields are being written, they must still satisfy
+          // the invariants. (Client can leave them alone; the rule
+          // only checks when they change.)
+          && (
+               !request.resource.data.diff(resource.data).affectedKeys()
+                 .hasAny(['mrp', 'offerPrice'])
+               ||
+               (request.resource.data.mrp is number
+                 && request.resource.data.mrp > 0
+                 && request.resource.data.offerPrice is number
+                 && request.resource.data.offerPrice > 0
+                 && request.resource.data.offerPrice <= request.resource.data.mrp)
+             );
+
+        allow delete: if isSignedIn()
+          && (isAdmin() || (isClinicAdmin() && clinicId == myClinicId()));
+      }
+
+      // ----- Subcollection: lab packages -----
+      //
+      // Package price is COMPUTED by the app from the included
+      // offerings' mrp / offerPrice. It is NOT passed by the client.
+      // Firestore rules enforce that the client cannot inject mrp /
+      // offerPrice on create or update — only the service account
+      // (which bypasses rules) or an admin can write those fields.
+      match /labPackages/{packageId} {
+        allow read: if isSignedIn();
+
+        allow create: if isSignedIn()
+          && (isAdmin() || (isClinicAdmin() && clinicId == myClinicId()))
+          && request.resource.data.keys().hasAll([
+               'name', 'includedTestOfferingIds', 'active', 'createdByUid'
+             ])
+          && request.resource.data.name is string
+          && request.resource.data.name.size() >= 3
+          && request.resource.data.includedTestOfferingIds is list
+          && request.resource.data.includedTestOfferingIds.size() > 0
+          // Client must not set any price field
+          && !request.resource.data.keys().hasAny([
+               'mrp', 'offerPrice',
+               'computedMrp', 'computedOfferPrice',
+               'computedDiscount', 'computedDiscountPercent'
+             ]);
+
+        allow update: if isSignedIn()
+          && (isAdmin() || (isClinicAdmin() && clinicId == myClinicId()))
+          // Client cannot change the computed price fields on update
+          // either — those are owned by the rebuild. Admin can
+          // override for corrections.
+          && (
+               isAdmin()
+               || !request.resource.data
+                     .diff(resource.data)
+                     .affectedKeys()
+                     .hasAny(['mrp', 'offerPrice',
+                              'computedMrp', 'computedOfferPrice',
+                              'computedDiscount', 'computedDiscountPercent'])
+             );
+
+        allow delete: if isSignedIn()
+          && (isAdmin() || (isClinicAdmin() && clinicId == myClinicId()));
+      }
+
+      // ----- Subcollection: denormalized catalog -----
+      //
+      // The catalog/main doc is written exclusively by the rebuild
+      // logic (service-side). The client should never write here —
+      // it's a cache. Only admins can override for repairs.
+      match /catalog/{docId} {
+        allow read: if isSignedIn();
+        allow write: if isAdmin();
+      }
+
+      // ----- Subcollection: departments -----
+      match /departments/{deptId} {
+        allow read: if isSignedIn();
+        allow write: if isSignedIn()
+          && (
+            isAdmin()
+            || (isClinicAdmin() && clinicId == myClinicId())
+            || (isLab() && clinicId == myClinicId())
+          );
+      }
+    }
 
     // =================================================================
     // INVITES
@@ -375,17 +495,12 @@ service cloud.firestore {
       allow write: if false;
     }
 
+   
 // =================================================================
 // CANONICAL TEST DICTIONARY
 // =================================================================
 match /tests/{testId} {
-  // Anyone signed in can read — needed by the doctor picker and
-  // the lab offering UI.
   allow read: if isSignedIn();
-
-  // Only platform admins can create canonical tests. The rule
-  // enforces the shape: fixed enum values, valid code format,
-  // and every required field present.
   allow create: if isAdmin()
     && request.resource.data.keys().hasAll([
          'code', 'name', 'codeLower', 'nameLower',
@@ -394,13 +509,6 @@ match /tests/{testId} {
        ])
     && request.resource.data.code is string
     && request.resource.data.code.matches('^[A-Z0-9_]{2,12}$')
-    && request.resource.data.name is string
-    && request.resource.data.name.size() >= 3
-    && request.resource.data.name.size() <= 80
-    && request.resource.data.codeLower ==
-         request.resource.data.code.lower()
-    && request.resource.data.nameLower ==
-         request.resource.data.name.lower()
     && request.resource.data.category in [
          'haematology', 'biochemistry', 'clinicalPathology',
          'serology', 'immunology', 'microbiology',
@@ -410,25 +518,14 @@ match /tests/{testId} {
     && request.resource.data.sampleType in [
          'blood', 'serum', 'plasma', 'urine', 'stool',
          'sputum', 'swab', 'csf', 'tissue', 'other'
-       ];
-
-  // Updates can change name, category, sampleType, fastingRequired,
-  // active, and the optional descriptive fields — but NOT code.
-  // Code is immutable once a test exists.
+       ]
+    && !request.resource.data.keys().hasAny(['mrp', 'offerPrice']);
   allow update: if isAdmin()
     && request.resource.data.code == resource.data.code
-    && request.resource.data.category in [
-         'haematology', 'biochemistry', 'clinicalPathology',
-         'serology', 'immunology', 'microbiology',
-         'endocrinology', 'tumourMarkers', 'cytology',
-         'histopathology', 'molecular', 'other'
-       ]
-    && request.resource.data.sampleType in [
-         'blood', 'serum', 'plasma', 'urine', 'stool',
-         'sputum', 'swab', 'csf', 'tissue', 'other'
-       ];
-
-  // Never hard-delete — soft-delete via active: false.
+    && !request.resource.data
+          .diff(resource.data)
+          .affectedKeys()
+          .hasAny(['mrp', 'offerPrice']);
   allow delete: if false;
 }
 

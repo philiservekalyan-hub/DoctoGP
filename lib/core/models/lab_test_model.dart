@@ -9,6 +9,7 @@ enum LabTestCategory {
   haematology,
   biochemistry,
   clinicalPathology,
+  parasitology,
   serology,
   immunology,
   microbiology,
@@ -29,6 +30,8 @@ extension LabTestCategoryX on LabTestCategory {
         return 'Biochemistry';
       case LabTestCategory.clinicalPathology:
         return 'Clinical Pathology';
+      case LabTestCategory.parasitology:
+        return 'Parasitology';    
       case LabTestCategory.serology:
         return 'Serology';
       case LabTestCategory.immunology:
@@ -69,6 +72,7 @@ enum LabSampleType {
   swab,
   csf,
   tissue,
+  semen,
   other,
 }
 
@@ -93,6 +97,8 @@ extension LabSampleTypeX on LabSampleType {
         return 'CSF';
       case LabSampleType.tissue:
         return 'Tissue';
+      case LabSampleType.semen:
+        return 'Semen';
       case LabSampleType.other:
         return 'Other';
     }
@@ -231,6 +237,19 @@ class LabTestModel {
   final String searchKey;
   final List<dynamic> searchTokens;
 
+  // ── NEW: offering fields (canonical or local) ──
+  final String? testId;          // set on canonical offerings
+  final bool isLocal;            // true on local tests
+  final String? localCode;       // on local tests
+  final String? localName;       // on local tests
+  final String? localCategory;   // on local tests
+  final String? localSampleType; // on local tests
+  final bool? localFastingRequired;
+  final num? mrp;                // ← the price
+  final num? offerPrice;         // ← the price
+  final int? discountPercent;
+  final String? displayName;     // optional override
+
   LabTestModel({
     required this.id,
     required this.labClinicId,
@@ -244,10 +263,21 @@ class LabTestModel {
     this.active = true,
     this.searchKey = '',
     this.searchTokens = const [],
+    this.testId,
+    this.isLocal = false,
+    this.localCode,
+    this.localName,
+    this.localCategory,
+    this.localSampleType,
+    this.localFastingRequired,
+    this.mrp,
+    this.offerPrice,
+    this.discountPercent,
+    this.displayName,
   });
 
-String get docId => id;
-String get display => code.isEmpty ? name : '$code — $name';
+  String get docId => id;
+  String get display => code.isEmpty ? name : '$code — $name';
 
   factory LabTestModel.fromMap(String id, Map<String, dynamic> m) {
     return LabTestModel(
@@ -263,9 +293,20 @@ String get display => code.isEmpty ? name : '$code — $name';
       active: m['active'] != false,
       searchKey: (m['searchKey'] ?? '').toString(),
       searchTokens: (m['searchTokens'] as List?) ?? const [],
+      // ── NEW ──
+      testId: m['testId']?.toString(),
+      isLocal: m['isLocal'] == true,
+      localCode: m['localCode']?.toString(),
+      localName: m['localName']?.toString(),
+      localCategory: m['localCategory']?.toString(),
+      localSampleType: m['localSampleType']?.toString(),
+      localFastingRequired: m['localFastingRequired'] as bool?,
+      mrp: m['mrp'] as num?,
+      offerPrice: m['offerPrice'] as num?,
+      discountPercent: (m['discountPercent'] as num?)?.toInt(),
+      displayName: m['displayName']?.toString(),
     );
   }
-
   /// Builds a normalized search index for a test. Used at creation
   /// time to denormalize searchable strings onto the doc.
   static ({String key, List<String> tokens}) buildSearchIndex({

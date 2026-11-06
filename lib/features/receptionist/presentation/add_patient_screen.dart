@@ -8,12 +8,19 @@ import '../../../core/models/patient_model.dart';
 import '../../../core/services/patient_service.dart';
 import '../../../core/widgets/dynamic_row_list.dart';
 import '../../../core/widgets/form_section.dart';
+import '../../../core/widgets/glass_card.dart';
 import '../../../core/widgets/labeled_field.dart';
 import '../../../core/widgets/tag_input.dart';
 import '../../../core/providers/service_providers.dart';
 
 class AddPatientScreen extends ConsumerStatefulWidget {
-  const AddPatientScreen({super.key});
+  /// Optional prefill from a lab customer match. When present, the form
+  /// starts with the lab's record pre-populated and `_adopted` set to
+  /// this match — so saving uses the lab's ID and creates the reverse
+  /// link. The receptionist can still correct any field before saving.
+  final LabCustomerMatch? prefill;
+
+  const AddPatientScreen({super.key, this.prefill});
 
   @override
   ConsumerState<AddPatientScreen> createState() => _AddPatientScreenState();
@@ -60,7 +67,27 @@ class _AddPatientScreenState extends ConsumerState<AddPatientScreen> {
   // Notes
   final _doctorNotes = TextEditingController();
 
+  // Adoption state — seeded from `widget.prefill` when present.
+  LabCustomerMatch? _adopted;
   bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+
+    // Seed adoption from prefill.
+    _adopted = widget.prefill;
+
+    // Pre-populate the editable fields from the prefill so the
+    // receptionist doesn't retype — but leaves them editable to fix
+    // typos or update contact details.
+    final p = widget.prefill;
+    if (p != null) {
+      _fullName.text = p.fullName;
+      _phone.text = p.phone;
+      _email.text = p.email;
+    }
+  }
 
   @override
   void dispose() {
@@ -133,6 +160,9 @@ class _AddPatientScreenState extends ConsumerState<AddPatientScreen> {
     );
   }
 
+  // -----------------------------------------------------------------
+  // Save
+  // -----------------------------------------------------------------
   Future<void> _save() async {
     if (!_formKey.currentState!.validate()) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -144,7 +174,6 @@ class _AddPatientScreenState extends ConsumerState<AddPatientScreen> {
       return;
     }
 
-    // Fetch the current user to attach their clinic to the patient
     final currentUser = await ref.read(currentUserProvider.future);
     if (currentUser == null || currentUser.clinicId == null) {
       if (mounted) {
@@ -160,9 +189,49 @@ class _AddPatientScreenState extends ConsumerState<AddPatientScreen> {
 
     setState(() => _saving = true);
 
+    // ── STEP 1: If no adoption yet, search linked labs before creating ──
+    List<LabCustomerMatch> matches = const [];
+    LabCustomerMatch? adopted = _adopted;
+
+    if (adopted == null) {
+      try {
+        matches = await ref
+            .read(patientServiceProvider)
+            .findLabCustomersAcrossLinkedLabs(
+              clinicId: currentUser.clinicId!,
+              phone: _phone.text.trim(),
+              email: _email.text.trim().isEmpty
+                  ? null
+                  : _email.text.trim(),
+            );
+      } catch (e) {
+        debugPrint('[AddPatient] linked lab search failed: $e');
+      }
+
+      // ── STEP 2: If matches exist, ask the receptionist ──
+      if (matches.isNotEmpty) {
+        if (!mounted) {
+          setState(() => _saving = false);
+          return;
+        }
+        setState(() => _saving = false);
+
+        final confirmed = await _showAdoptionSheet(matches);
+        if (confirmed.cancelled) {
+          return;
+        }
+        if (confirmed.match != null) {
+          adopted = confirmed.match;
+          setState(() => _adopted = adopted);
+        }
+        setState(() => _saving = true);
+      }
+    }
+
+    // ── STEP 3: Build the patient model ──
     final patient = PatientModel(
       docId: '',
-      patientId: '',
+      patientId: adopted?.displayPatientId ?? '',
       fullName: _fullName.text.trim(),
       phone: _phone.text.trim(),
       email: _email.text.trim().isEmpty ? null : _email.text.trim(),
@@ -202,11 +271,13 @@ class _AddPatientScreenState extends ConsumerState<AddPatientScreen> {
       doctorNotes: _doctorNotes.text.trim().isEmpty
           ? null
           : _doctorNotes.text.trim(),
-
-      // NEW: clinic scoping
       clinicId: currentUser.clinicId,
       createdByUserId: currentUser.uid,
       active: true,
+      linkedLabCustomerDocId: adopted?.customerDocId,
+      linkedLabClinicId: adopted?.labClinicId,
+      linkedLabCustomerDocIds:
+          matches.map((m) => m.customerDocId).toList(),
     );
 
     try {
@@ -241,6 +312,30 @@ class _AddPatientScreenState extends ConsumerState<AddPatientScreen> {
               Text('${saved.fullName} • ${saved.phone}',
                   style: const TextStyle(
                       color: AppColors.textSecondary)),
+              if (saved.isLabAdopted) ...[
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: AppColors.info.withOpacity(.1),
+                    borderRadius: BorderRadius.circular(8),
+                    border:
+                        Border.all(color: AppColors.info.withOpacity(.3)),
+                  ),
+                  child: Row(children: [
+                    const Icon(Icons.link_rounded,
+                        color: AppColors.info, size: 16),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Linked to existing lab record · history preserved',
+                        style: AppTextStyles.caption
+                            .copyWith(color: AppColors.info),
+                      ),
+                    ),
+                  ]),
+                ),
+              ],
             ],
           ),
           actions: [
@@ -267,6 +362,123 @@ class _AddPatientScreenState extends ConsumerState<AddPatientScreen> {
     }
   }
 
+  // -----------------------------------------------------------------
+  // Adoption confirmation sheet (unchanged from previous delivery)
+  // -----------------------------------------------------------------
+  Future<_AdoptionResult> _showAdoptionSheet(
+      List<LabCustomerMatch> matches) async {
+    final result = await showModalBottomSheet<_AdoptionResult>(
+      context: context,
+      isScrollControlled: true,
+      isDismissible: false,
+      enableDrag: false,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (sheetContext) => ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(sheetContext).size.height * 0.85,
+        ),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(children: [
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: AppColors.info.withOpacity(.13),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: const Icon(Icons.person_search_rounded,
+                      color: AppColors.info, size: 22),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    matches.length == 1
+                        ? 'A record already exists'
+                        : '${matches.length} records found',
+                    style: AppTextStyles.h3,
+                  ),
+                ),
+              ]),
+              const SizedBox(height: 12),
+              Text(
+                'This patient already has a record in a linked lab. '
+                'Using the existing ID keeps their history continuous.',
+                style: AppTextStyles.bodyMuted,
+              ),
+              const SizedBox(height: 16),
+              ...matches.map((m) => Padding(
+                    padding: const EdgeInsets.only(bottom: 10),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () => Navigator.of(sheetContext)
+                          .pop(_AdoptionResult(match: m)),
+                      child: Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: AppColors.background,
+                          borderRadius: BorderRadius.circular(12),
+                          border:
+                              Border.all(color: AppColors.cardBorder),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(m.fullName,
+                                style: AppTextStyles.body.copyWith(
+                                    fontWeight: FontWeight.w600)),
+                            const SizedBox(height: 4),
+                            Text('${m.displayPatientId} • ${m.labName}',
+                                style: AppTextStyles.caption),
+                            const SizedBox(height: 2),
+                            Text('${m.phone} • ${m.email}',
+                                style: AppTextStyles.caption),
+                            const SizedBox(height: 10),
+                            Row(children: [
+                              const Icon(Icons.check_circle_rounded,
+                                  color: AppColors.success, size: 16),
+                              const SizedBox(width: 6),
+                              Text('Use this ID',
+                                  style: AppTextStyles.caption.copyWith(
+                                      color: AppColors.success,
+                                      fontWeight: FontWeight.w600)),
+                            ]),
+                          ],
+                        ),
+                      ),
+                    ),
+                  )),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: () => Navigator.of(sheetContext)
+                    .pop(const _AdoptionResult(match: null)),
+                icon: const Icon(Icons.add_rounded),
+                label: const Text('Not the same person — create new PT- ID'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: AppColors.textSecondary,
+                  side: BorderSide(color: AppColors.cardBorder),
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    return result ?? const _AdoptionResult.cancelled();
+  }
+
+  // -----------------------------------------------------------------
+  // Build
+  // -----------------------------------------------------------------
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -295,6 +507,7 @@ class _AddPatientScreenState extends ConsumerState<AddPatientScreen> {
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: [
+            if (_adopted != null) _adoptionBanner(),
             _sectionPersonal(),
             _sectionMedical(),
             _sectionCurrentMedication(),
@@ -317,8 +530,59 @@ class _AddPatientScreenState extends ConsumerState<AddPatientScreen> {
     );
   }
 
+  /// Adoption banner — visible whenever `_adopted` is set (either from
+  /// the prefill constructor arg or from a mid-flow confirmation).
+  /// Shows a "Change" button so the receptionist can override the
+  /// adoption if they realize it's a different person.
+  Widget _adoptionBanner() {
+    final a = _adopted!;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: GlassCard(
+        borderColor: AppColors.info.withOpacity(.4),
+        child: Row(children: [
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: AppColors.info.withOpacity(.13),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: const Icon(Icons.link_rounded,
+                color: AppColors.info, size: 20),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Using existing lab ID',
+                    style: AppTextStyles.body.copyWith(
+                        fontWeight: FontWeight.w600)),
+                const SizedBox(height: 2),
+                Text('${a.displayPatientId} • ${a.labName}',
+                    style: AppTextStyles.caption),
+              ],
+            ),
+          ),
+          TextButton(
+            onPressed: () => setState(() => _adopted = null),
+            style: TextButton.styleFrom(
+              foregroundColor: AppColors.textMuted,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              minimumSize: const Size(0, 0),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              textStyle: const TextStyle(
+                  fontSize: 12, fontWeight: FontWeight.w600),
+            ),
+            child: const Text('Change'),
+          ),
+        ]),
+      ),
+    );
+  }
+
   // -----------------------------------------------------------------
-  // SECTIONS
+  // SECTIONS (unchanged — identical to your current file)
   // -----------------------------------------------------------------
 
   Widget _sectionPersonal() {
@@ -755,4 +1019,16 @@ class _AddPatientScreenState extends ConsumerState<AddPatientScreen> {
       ],
     );
   }
+}
+
+// -----------------------------------------------------------------
+// Adoption result type (unchanged)
+// -----------------------------------------------------------------
+class _AdoptionResult {
+  final LabCustomerMatch? match;
+  final bool cancelled;
+  const _AdoptionResult({this.match, this.cancelled = false});
+  const _AdoptionResult.cancelled()
+      : match = null,
+        cancelled = true;
 }

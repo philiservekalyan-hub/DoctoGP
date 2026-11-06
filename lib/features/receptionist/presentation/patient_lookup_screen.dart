@@ -6,10 +6,12 @@ import '../../../app/theme/app_colors.dart';
 import '../../../app/theme/app_text_styles.dart';
 import '../../../core/models/appointment_model.dart';
 import '../../../core/services/reception_stats_service.dart';
+import '../../../core/services/dashboard_service.dart';
 import '../../../core/widgets/glass_card.dart';
 import '../../../core/widgets/section_header.dart';
 import '../../../shared/widgets/clinic_app_bar.dart';
 import '../../shared/reschedule_appointment_dialog.dart';
+
 
 class PatientLookupScreen extends ConsumerWidget {
   final String patientDocId;

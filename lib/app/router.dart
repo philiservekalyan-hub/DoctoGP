@@ -1,4 +1,7 @@
 // lib/app/router.dart
+
+import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -12,10 +15,11 @@ import '../features/auth/presentation/login_screen.dart';
 import '../features/auth/presentation/signup_screen.dart';
 import '../features/auth/presentation/splash_screen.dart';
 import '../features/doctor/presentation/doctor_shell.dart';
+import '../features/lab/presentation/lab_dashboard.dart';
 import '../features/lab/presentation/lab_receptionist_dashboard.dart';
 import '../features/lab/presentation/lab_shell.dart';
 import '../features/nurse/presentation/nurse_shell.dart';
-import '../features/owner/presentation/owner_shell.dart';
+import '../features/owner/presentation/doctor_owner_dashboard.dart';
 import '../features/patient/presentation/patient_shell.dart';
 import '../features/receptionist/presentation/clinic_settings_screen.dart';
 import '../features/receptionist/presentation/receptionist_shell.dart';
@@ -27,18 +31,39 @@ final authStateProvider = StreamProvider<User?>((ref) {
 });
 
 final currentUserProvider = FutureProvider<UserModel?>((ref) async {
-  final authState = await ref.watch(authStateProvider.future);
+  final User? authState;
+  try {
+    authState = await ref
+        .watch(authStateProvider.future)
+        .timeout(const Duration(seconds: 5));
+  } on TimeoutException catch (e) {
+    debugPrint('[currentUserProvider] authState timed out: $e');
+    return null;
+  } catch (e) {
+    debugPrint('[currentUserProvider] authState failed: $e');
+    return null;
+  }
+
   if (authState == null) return null;
 
-  final doc = await FirebaseFirestore.instance
-      .collection('users')
-      .where('email', isEqualTo: authState.email?.trim().toLowerCase())
-      .limit(1)
-      .get();
+  try {
+    final doc = await FirebaseFirestore.instance
+        .collection('users')
+        .where('email', isEqualTo: authState.email?.trim().toLowerCase())
+        .limit(1)
+        .get()
+        .timeout(const Duration(seconds: 6));
 
-  if (doc.docs.isEmpty) return null;
-  final d = doc.docs.first;
-  return UserModel.fromMap(d.id, d.data());
+    if (doc.docs.isEmpty) return null;
+    final d = doc.docs.first;
+    return UserModel.fromMap(d.id, d.data());
+  } on TimeoutException catch (e) {
+    debugPrint('[currentUserProvider] users lookup timed out: $e');
+    return null;
+  } catch (e) {
+    debugPrint('[currentUserProvider] users lookup failed: $e');
+    return null;
+  }
 });
 
 Future<String> _landingForUser(UserModel user) async {
@@ -46,7 +71,21 @@ Future<String> _landingForUser(UserModel user) async {
     case UserRole.patient:
       return '/patient';
     case UserRole.owner:
-      return '/owner';
+      // Lab owners → /lab. Clinic owners → /doctor/owner (DoctorOwnerDashboard).
+      if (user.orgType == 'lab') return '/lab';
+      if (user.orgType == 'clinic') return '/doctor/owner';
+      if (user.clinicId == null || user.clinicId!.isEmpty) {
+        return '/doctor/owner';
+      }
+      try {
+        final org = await FirebaseFirestore.instance
+            .collection('clinics')
+            .doc(user.clinicId)
+            .get();
+        final type = org.data()?['type'];
+        if (type == 'lab') return '/lab';
+      } catch (_) {}
+      return '/doctor/owner';
     case UserRole.doctor:
       return '/doctor';
     case UserRole.nurse:
@@ -84,31 +123,25 @@ final routerProvider = Provider<GoRouter>((ref) {
           location == '/login' ||
           location == '/signup';
 
-      // ── Fast path ──
-      // Check Firebase's synchronous auth state first. This is the
-      // source of truth and is cleared the instant signOut() resolves.
-      // currentUserProvider is cached and can lag by one frame after
-      // logout — consulting it first caused a redirect loop back to
-      // the dashboard. This guard fixes that.
       if (FirebaseAuth.instance.currentUser == null) {
         return isPublic ? null : '/login';
       }
 
-      // From here on, Firebase says we're signed in. Load the profile.
       final user = await ref.read(currentUserProvider.future);
 
-      // Firebase is signed in but no user doc exists — treat as logged out.
       if (user == null) {
         return isPublic ? null : '/login';
       }
 
-      // Signed in, sitting on a public page — send to the landing dashboard.
+      if (user.active == false) {
+        FirebaseAuth.instance.signOut().catchError((_) {});
+        return '/login';
+      }
+
       if (isPublic) {
         return await _landingForUser(user);
       }
 
-      // Receptionist cross-guard: a lab receptionist should not land on
-      // /reception and vice versa.
       if (user.role == UserRole.receptionist) {
         final landing = await _landingForUser(user);
         if (landing == '/lab-reception' &&
@@ -153,6 +186,10 @@ final routerProvider = Provider<GoRouter>((ref) {
         builder: (_, __) => const DoctorShell(),
       ),
       GoRoute(
+        path: '/doctor/owner',
+        builder: (_, __) => const DoctorOwnerDashboard(),
+      ),
+      GoRoute(
         path: '/nurse',
         builder: (_, __) => const NurseShell(),
       ),
@@ -161,8 +198,14 @@ final routerProvider = Provider<GoRouter>((ref) {
         builder: (_, __) => const LabShell(),
       ),
       GoRoute(
+        path: '/lab/tech',
+        builder: (_, __) => const LabDashboard(),
+      ),
+      // Alias kept so any old '/owner' deep-link still lands on the
+      // owner dashboard (previously OwnerShell).
+      GoRoute(
         path: '/owner',
-        builder: (_, __) => const OwnerShell(),
+        builder: (_, __) => const DoctorOwnerDashboard(),
       ),
       GoRoute(
         path: '/admin',

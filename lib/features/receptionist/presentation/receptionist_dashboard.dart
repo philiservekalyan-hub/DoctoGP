@@ -8,8 +8,9 @@ import '../../../../app/theme/app_text_styles.dart';
 import '../../../../core/models/appointment_model.dart';
 import '../../../../core/models/appointment_request_model.dart';
 import '../../../../core/providers/service_providers.dart';
-import '../../../../core/services/dashboard_service.dart'
-    hide patientSearchProvider, patientAppointmentsProvider;
+import '../../../../core/services/dashboard_service.dart';
+    
+import '../../../../core/services/patient_service.dart';   // NEW
 import '../../../../core/services/reception_stats_service.dart';
 import '../../../../core/widgets/empty_state.dart';
 import '../../../../core/widgets/glass_card.dart';
@@ -17,11 +18,10 @@ import '../../../../core/widgets/section_header.dart';
 import '../../../../shared/widgets/clinic_app_bar.dart';
 import '../../shared/find_appointment_screen.dart';
 import '../../shared/reschedule_appointment_dialog.dart';
+import 'add_patient_screen.dart';                          // NEW
 import 'patient_lookup_screen.dart';
 import 'pending_requests_screen.dart';
 import 'unpaid_today_screen.dart';
-
-   
 
 class ReceptionistDashboard extends ConsumerStatefulWidget {
   const ReceptionistDashboard({super.key});
@@ -52,6 +52,14 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
 
     return Scaffold(
       backgroundColor: AppColors.background,
+      // NEW: floating action button to add a new patient
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => _openAddPatient(context),
+        backgroundColor: AppColors.primary,
+        foregroundColor: Colors.white,
+        icon: const Icon(Icons.person_add_alt_1_rounded),
+        label: const Text('New Patient'),
+      ),
       appBar: ClinicAppBar(
         title: 'Reception',
         extraActions: [
@@ -139,7 +147,7 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
                   const SizedBox(height: 24),
                   const SectionHeader(title: 'Routed to Doctor'),
                   _routedList(routedAsync),
-                  const SizedBox(height: 40),
+                  const SizedBox(height: 80),   // was 40 — extra space for the FAB
                 ],
               ),
             ),
@@ -147,6 +155,20 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
         ),
       ),
     );
+  }
+
+  // NEW: open AddPatientScreen and refresh dashboards if a patient was added
+  Future<void> _openAddPatient(BuildContext context) async {
+    final added = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(builder: (_) => const AddPatientScreen()),
+    );
+    if (added == true) {
+      ref.invalidate(todayAllAppointmentsProvider);
+      ref.invalidate(todayInvoiceStatsProvider);
+      ref.invalidate(routedToDoctorProvider);
+      ref.invalidate(pendingRequestsProvider);
+      ref.invalidate(appointmentsForDayProvider(_queueDay));
+    }
   }
 
   // -------------------------------------------------------------
@@ -176,12 +198,14 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
   void _openSearchResults(BuildContext context, String q) {
     Navigator.push(
       context,
-      MaterialPageRoute(builder: (_) => _PatientSearchResults(query: q)),
+      MaterialPageRoute(
+        builder: (_) => _PatientSearchResults(query: q),
+      ),
     );
   }
 
   // -------------------------------------------------------------
-  // Needs attention
+  // Needs attention (unchanged)
   // -------------------------------------------------------------
   Widget _needsAttention(
     BuildContext context,
@@ -304,7 +328,7 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
       );
 
   // -------------------------------------------------------------
-  // Today at a glance
+  // Today at a glance (unchanged)
   // -------------------------------------------------------------
   Widget _glanceGrid(
       AsyncValue<List<AppointmentModel>> todayAsync,
@@ -407,7 +431,7 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
       );
 
   // -------------------------------------------------------------
-  // Today by doctor
+  // Today by doctor (unchanged)
   // -------------------------------------------------------------
   Widget _byDoctor(AsyncValue<List<AppointmentModel>> todayAsync) {
     final today = todayAsync.asData?.value ?? const <AppointmentModel>[];
@@ -476,7 +500,7 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
       );
 
   // -------------------------------------------------------------
-  // Today by slot
+  // Today by slot (unchanged)
   // -------------------------------------------------------------
   Widget _bySlot(AsyncValue<List<AppointmentModel>> todayAsync) {
     final today = todayAsync.asData?.value ?? const <AppointmentModel>[];
@@ -549,7 +573,7 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
   }
 
   // -------------------------------------------------------------
-  // Queue list
+  // Queue list (unchanged)
   // -------------------------------------------------------------
   Widget _queueList(AsyncValue<List<AppointmentModel>> dayAsync) {
     return dayAsync.when(
@@ -586,7 +610,7 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
   }
 
   // -------------------------------------------------------------
-  // Routed list
+  // Routed list (unchanged)
   // -------------------------------------------------------------
   Widget _routedList(AsyncValue<List<AppointmentModel>> routedAsync) {
     return routedAsync.when(
@@ -651,7 +675,7 @@ class _GlanceTile {
 }
 
 // ----------------------------------------------------------------
-// Queue row  ── UPDATED: fees badge, Mark paid, reception-safe inConsult
+// Queue row — unchanged
 // ----------------------------------------------------------------
 class _SimpleQueueRow extends ConsumerWidget {
   final AppointmentModel appointment;
@@ -1117,7 +1141,7 @@ class _SimpleQueueRow extends ConsumerWidget {
 }
 
 // ----------------------------------------------------------------
-// Force-complete fees dialog (used only from _SimpleQueueRow)
+// Force-complete fees dialog — unchanged
 // ----------------------------------------------------------------
 class _ReceptionFeesDialog extends StatefulWidget {
   const _ReceptionFeesDialog();
@@ -1188,7 +1212,7 @@ class _ReceptionFeesDialogState extends State<_ReceptionFeesDialog> {
 }
 
 // ----------------------------------------------------------------
-// Routed row (unchanged)
+// Routed row — unchanged
 // ----------------------------------------------------------------
 class _RoutedRow extends ConsumerWidget {
   final AppointmentModel appointment;
@@ -1285,20 +1309,61 @@ class _RoutedRow extends ConsumerWidget {
 }
 
 // ----------------------------------------------------------------
-// Patient search results (unchanged)
+// Patient search results — UPDATED: also searches linked labs
 // ----------------------------------------------------------------
-class _PatientSearchResults extends ConsumerWidget {
+class _PatientSearchResults extends ConsumerStatefulWidget {
   final String query;
   const _PatientSearchResults({required this.query});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final resultsAsync = ref.watch(patientSearchProvider(query));
+  ConsumerState<_PatientSearchResults> createState() =>
+      _PatientSearchResultsState();
+}
+
+class _PatientSearchResultsState
+    extends ConsumerState<_PatientSearchResults> {
+  // NEW: lab customer matches surfaced alongside clinic patients
+  bool _searchingLabs = true;
+  List<LabCustomerMatch> _labMatches = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _searchLinkedLabs();
+  }
+
+ Future<void> _searchLinkedLabs() async {
+  try {
+    final user = await ref.read(currentUserProvider.future);
+    if (user?.clinicId == null) {
+      if (mounted) setState(() => _searchingLabs = false);
+      return;
+    }
+    final matches = await ref
+        .read(patientServiceProvider)
+        .findLabCustomersAcrossLinkedLabs(
+          clinicId: user!.clinicId!,
+          name: widget.query.trim(),   // method auto-detects phone/email/name
+        );
+    if (mounted) {
+      setState(() {
+        _labMatches = matches;
+        _searchingLabs = false;
+      });
+    }
+  } catch (_) {
+    if (mounted) setState(() => _searchingLabs = false);
+  }
+}
+
+  @override
+  Widget build(BuildContext context) {
+    final resultsAsync = ref.watch(patientSearchProvider(widget.query));
 
     return Scaffold(
       backgroundColor: AppColors.background,
       appBar: ClinicAppBar(
-        title: 'Results · $query',
+        title: 'Results · ${widget.query}',
         showBackButton: true,
       ),
       body: SafeArea(
@@ -1309,7 +1374,11 @@ class _PatientSearchResults extends ConsumerWidget {
               child: Text('Error: $e',
                   style: const TextStyle(color: AppColors.error))),
           data: (list) {
-            if (list.isEmpty) {
+            final hasClinic = list.isNotEmpty;
+            final hasLab = _labMatches.isNotEmpty;
+            final loading = _searchingLabs;
+
+            if (!hasClinic && !hasLab && !loading) {
               return Center(
                 child: Padding(
                   padding: const EdgeInsets.all(24),
@@ -1319,23 +1388,133 @@ class _PatientSearchResults extends ConsumerWidget {
                       const Icon(Icons.search_off_rounded,
                           size: 48, color: AppColors.textMuted),
                       const SizedBox(height: 12),
-                      Text('No patients matched "$query"',
+                      Text('No patients matched "${widget.query}"',
                           style: AppTextStyles.bodyMuted,
                           textAlign: TextAlign.center),
+                      const SizedBox(height: 20),
+                      ElevatedButton.icon(
+                        onPressed: () async {
+                          final added = await Navigator.of(context).push<bool>(
+                            MaterialPageRoute(
+                                builder: (_) => const AddPatientScreen()),
+                          );
+                          if (added == true && context.mounted) {
+                            Navigator.of(context).pop();
+                          }
+                        },
+                        icon: const Icon(Icons.person_add_alt_1_rounded),
+                        label: const Text('Create new patient'),
+                      ),
                     ],
                   ),
                 ),
               );
             }
-            return ListView.builder(
+
+            return ListView(
               padding: const EdgeInsets.all(16),
-              itemCount: list.length,
-              itemBuilder: (_, i) => Padding(
-                padding: const EdgeInsets.only(bottom: 10),
-                child: _resultCard(context, list[i]),
-              ),
+              children: [
+                if (hasLab) ...[
+                  const Padding(
+                    padding: EdgeInsets.only(bottom: 8),
+                    child: Text('Found in linked labs',
+                        style: TextStyle(
+                            fontWeight: FontWeight.w600,
+                            color: AppColors.textSecondary)),
+                  ),
+                  ..._labMatches.map((m) => Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: _labMatchCard(context, m),
+                      )),
+                  if (hasClinic) const SizedBox(height: 12),
+                ],
+                if (hasClinic) ...[
+                  const Padding(
+                    padding: EdgeInsets.only(bottom: 8),
+                    child: Text('Registered with your clinic',
+                        style: TextStyle(
+                            fontWeight: FontWeight.w600,
+                            color: AppColors.textSecondary)),
+                  ),
+                  ...list.map((p) => Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: _resultCard(context, p),
+                      )),
+                ],
+                if (loading)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 20),
+                    child: Center(
+                        child: CircularProgressIndicator(
+                            color: AppColors.primary)),
+                  ),
+              ],
             );
           },
+        ),
+      ),
+    );
+  }
+
+  // NEW: lab match card with "Register as clinic patient" action
+  Widget _labMatchCard(BuildContext context, LabCustomerMatch m) {
+    return GlassCard(
+      borderColor: AppColors.info.withOpacity(.4),
+      child: Padding(
+        padding: const EdgeInsets.all(4),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: AppColors.info.withOpacity(.13),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: const Icon(Icons.science_outlined,
+                    color: AppColors.info, size: 20),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(m.fullName, style: AppTextStyles.body),
+                    const SizedBox(height: 2),
+                    Text(
+                      '${m.displayPatientId} • ${m.labName}',
+                      style: AppTextStyles.caption,
+                    ),
+                    const SizedBox(height: 2),
+                    Text('${m.phone} • ${m.email}',
+                        style: AppTextStyles.caption),
+                  ],
+                ),
+              ),
+            ]),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: () async {
+                  final added = await Navigator.of(context).push<bool>(
+  MaterialPageRoute(
+      builder: (_) => AddPatientScreen(prefill: m)),
+);
+                  if (added == true && context.mounted) {
+                    Navigator.of(context).pop();
+                  }
+                },
+                icon: const Icon(Icons.person_add_alt_1_rounded, size: 16),
+                label: const Text('Register as clinic patient'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: AppColors.info,
+                  side: const BorderSide(color: AppColors.info),
+                ),
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -1396,7 +1575,7 @@ class _PatientSearchResults extends ConsumerWidget {
 }
 
 // ----------------------------------------------------------------
-// Menu row helper (unchanged)
+// Menu row helper — unchanged
 // ----------------------------------------------------------------
 class _MenuRow extends StatelessWidget {
   final IconData icon;

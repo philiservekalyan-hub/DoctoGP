@@ -1,13 +1,18 @@
+// lib/features/lab/presentation/lab_walkin_order_screen.dart
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../app/router.dart';
 import '../../../app/theme/app_colors.dart';
 import '../../../app/theme/app_text_styles.dart';
+import '../../../core/models/lab_customer_model.dart';
 import '../../../core/models/lab_order_model.dart';
 import '../../../core/models/lab_test_model.dart';
 import '../../../core/models/patient_model.dart';
 import '../../../core/providers/service_providers.dart';
+import '../../../core/services/lab_customer_service.dart';
+import '../../../core/widgets/glass_card.dart';
 import '../../../core/widgets/labeled_field.dart';
 
 class LabWalkinOrderScreen extends ConsumerStatefulWidget {
@@ -18,31 +23,75 @@ class LabWalkinOrderScreen extends ConsumerStatefulWidget {
       _LabWalkinOrderScreenState();
 }
 
-class _LabWalkinOrderScreenState
-    extends ConsumerState<LabWalkinOrderScreen> {
-  PatientModel? _patient;
+class _LabWalkinOrderScreenState extends ConsumerState<LabWalkinOrderScreen> {
+  final _customerSvc = LabCustomerService();
+
+  LabCustomerModel? _customer; // the confirmed customer
   final List<LabTestModel> _selectedTests = [];
-  final _amountCtrl = TextEditingController();
+  final _extraDiscountCtrl = TextEditingController();
   final _instructionsCtrl = TextEditingController();
   bool _saving = false;
 
+  // ── Derived pricing getters ──
+
+  double get _totalMrp => _selectedTests.fold<double>(
+        0,
+        (s, t) => s + (t.mrp?.toDouble() ?? 0),
+      );
+
+  double get _totalCatalogDiscount => _selectedTests.fold<double>(
+        0,
+        (s, t) {
+          final mrp = t.mrp?.toDouble() ?? 0;
+          final offer = t.offerPrice?.toDouble() ?? mrp;
+          return s + (mrp - offer);
+        },
+      );
+
+  double get _totalTestOffer => _totalMrp - _totalCatalogDiscount;
+
+  double get _extraDiscount {
+    final raw = double.tryParse(_extraDiscountCtrl.text.trim()) ?? 0;
+    if (raw < 0) return 0;
+    return raw;
+  }
+
+  double get _billableAmount {
+    final net = _totalTestOffer - _extraDiscount;
+    return net < 0 ? 0 : net;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _extraDiscountCtrl.addListener(_onDiscountChanged);
+  }
+
+  void _onDiscountChanged() {
+    if (mounted) setState(() {});
+  }
+
   @override
   void dispose() {
-    _amountCtrl.dispose();
+    _extraDiscountCtrl.removeListener(_onDiscountChanged);
+    _extraDiscountCtrl.dispose();
     _instructionsCtrl.dispose();
     super.dispose();
   }
 
-  Future<void> _pickPatient() async {
+  Future<void> _pickCustomer() async {
     final user = await ref.read(currentUserProvider.future);
     if (user?.clinicId == null) return;
-    final result = await Navigator.of(context).push<PatientModel>(
+    final result = await Navigator.of(context).push<LabCustomerModel>(
       MaterialPageRoute(
-        builder: (_) =>
-            _WalkInPatientPickerScreen(clinicId: user!.clinicId!),
+        builder: (_) => _CustomerPickerScreen(
+          labClinicId: user!.clinicId!,
+          labName: user.clinicName ?? 'Lab',
+          customerSvc: _customerSvc,
+        ),
       ),
     );
-    if (result != null && mounted) setState(() => _patient = result);
+    if (result != null && mounted) setState(() => _customer = result);
   }
 
   Future<void> _pickTests(String labClinicId) async {
@@ -60,23 +109,31 @@ class _LabWalkinOrderScreenState
         preselected: _selectedTests,
       ),
     );
-    if (result != null && mounted) {
-      setState(() {
-        _selectedTests
-          ..clear()
-          ..addAll(result);
-      });
-    }
+    if (result == null || !mounted) return;
+
+    setState(() {
+      _selectedTests
+        ..clear()
+        ..addAll(result);
+    });
   }
 
   Future<void> _save() async {
     if (_saving) return;
-    if (_patient == null) {
-      _snack('Pick a patient.', AppColors.error);
+    if (_customer == null) {
+      _snack('Pick or create a customer.', AppColors.error);
       return;
     }
     if (_selectedTests.isEmpty) {
       _snack('Select at least one test.', AppColors.error);
+      return;
+    }
+    if (_extraDiscount > _totalTestOffer) {
+      _snack(
+        'Off-counter discount (₹${_extraDiscount.toStringAsFixed(0)}) '
+        'exceeds test total (₹${_totalTestOffer.toStringAsFixed(0)}).',
+        AppColors.error,
+      );
       return;
     }
 
@@ -88,28 +145,36 @@ class _LabWalkinOrderScreenState
         return;
       }
 
-      final amount = double.tryParse(_amountCtrl.text.trim());
-
       await ref.read(labServiceProvider).createOrder(
-            referringClinicId: null, // walk-in
+            referringClinicId: null,
             labClinicId: user.clinicId!,
             labName: user.clinicName ?? 'Lab',
-            patientDocId: _patient!.docId,
-            patientId: _patient!.patientId,
-            patientName: _patient!.fullName,
-            patientPhone: _patient!.phone,
-            doctorDocId: null, // walk-in
+            patientDocId:
+                _customer!.sourcePatientDocId ?? _customer!.docId,
+            patientId: _customer!.displayPatientId,
+            patientName: _customer!.fullName,
+            patientPhone: _customer!.phone,
+            patientEmail: _customer!.email,
+            patientGender: _customer!.gender,
+            patientDob: _customer!.dob,
+            patientBloodGroup: _customer!.bloodGroup,
+            doctorDocId: null,
             doctorName: null,
             tests: _selectedTests
                 .map((t) => LabTestItem(
                       code: t.code.isEmpty ? null : t.code,
                       name: t.name,
+                      unitPrice:
+                          (t.offerPrice ?? t.mrp)?.toDouble(),
                     ))
                 .toList(),
             instructions: _instructionsCtrl.text.trim().isEmpty
                 ? null
                 : _instructionsCtrl.text.trim(),
-            billableAmount: amount,
+            billableAmount: _billableAmount,
+            existingCustomer: _customer,
+            catalogAmount: _totalTestOffer,
+            extraDiscount: _extraDiscount,
           );
 
       if (!mounted) return;
@@ -148,30 +213,26 @@ class _LabWalkinOrderScreenState
           return ListView(
             padding: const EdgeInsets.all(20),
             children: [
-              Text('Walk-in patient', style: AppTextStyles.h3),
+              Text('Walk-in customer', style: AppTextStyles.h3),
               const SizedBox(height: 4),
               Text(
-                'No referral — patient walked into the lab directly.',
+                'Search linked-clinic patients by phone, or create a new lab customer.',
                 style: AppTextStyles.bodyMuted,
               ),
               const SizedBox(height: 20),
               LabeledField(
-                label: 'Patient',
+                label: 'Customer',
                 required: true,
-                child: _patientPicker(),
+                child: _customerPicker(),
               ),
               LabeledField(
                 label: 'Tests',
                 required: true,
                 child: _testsPicker(labClinicId),
               ),
-              LabeledField(
-                label: 'Amount to collect (optional)',
-                child: DarkTextField(
-                  controller: _amountCtrl,
-                  hint: 'e.g. 500',
-                ),
-              ),
+              const SizedBox(height: 16),
+              _billableSummaryCard(),
+              const SizedBox(height: 16),
               LabeledField(
                 label: 'Instructions (optional)',
                 child: DarkTextField(
@@ -197,8 +258,79 @@ class _LabWalkinOrderScreenState
     );
   }
 
-  Widget _patientPicker() => GestureDetector(
-        onTap: _pickPatient,
+  Widget _billableSummaryCard() {
+    return GlassCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Billable summary', style: AppTextStyles.label),
+          const SizedBox(height: 12),
+          _summaryRow('MRP', _totalMrp),
+          const SizedBox(height: 6),
+          _summaryRow(
+            'Catalog discount',
+            -_totalCatalogDiscount,
+            color: AppColors.success,
+          ),
+          const Divider(height: 20, color: AppColors.cardBorder),
+          _summaryRow('Test total (offer)', _totalTestOffer),
+          const SizedBox(height: 12),
+          LabeledField(
+            label: 'Off-counter discount (optional)',
+            child: DarkTextField(
+              controller: _extraDiscountCtrl,
+              hint: '0',
+            ),
+          ),
+          if (_extraDiscount > _totalTestOffer)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                'Discount exceeds test total',
+                style: AppTextStyles.caption
+                    .copyWith(color: AppColors.error),
+              ),
+            ),
+          const Divider(height: 20, color: AppColors.cardBorder),
+          Row(children: [
+            Expanded(
+              child: Text(
+                'Amount to collect',
+                style: AppTextStyles.body
+                    .copyWith(fontWeight: FontWeight.w600),
+              ),
+            ),
+            Text(
+              '₹${_billableAmount.toStringAsFixed(0)}',
+              style:
+                  AppTextStyles.h3.copyWith(color: AppColors.primary),
+            ),
+          ]),
+        ],
+      ),
+    );
+  }
+
+  Widget _summaryRow(String label, double value, {Color? color}) {
+    final isNegative = value < 0;
+    final display =
+        '${isNegative ? "−" : ""}₹${value.abs().toStringAsFixed(0)}';
+    return Row(children: [
+      Expanded(
+        child: Text(label, style: AppTextStyles.caption),
+      ),
+      Text(
+        display,
+        style: AppTextStyles.caption.copyWith(
+          color: color ?? AppColors.textPrimary,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    ]);
+  }
+
+  Widget _customerPicker() => GestureDetector(
+        onTap: _pickCustomer,
         child: Container(
           padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
@@ -211,17 +343,19 @@ class _LabWalkinOrderScreenState
                 color: AppColors.textMuted),
             const SizedBox(width: 12),
             Expanded(
-              child: _patient == null
-                  ? const Text('Tap to select patient',
+              child: _customer == null
+                  ? const Text('Tap to find or create customer',
                       style: TextStyle(color: AppColors.textMuted))
                   : Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(_patient!.fullName,
+                        Text(_customer!.fullName,
                             style: AppTextStyles.body),
                         Text(
-                            '${_patient!.patientId} • ${_patient!.phone}',
-                            style: AppTextStyles.caption),
+                          '${_customer!.displayPatientId} • ${_customer!.phone}'
+                          '${_customer!.isClinicLinked ? " • from ${_customer!.sourceClinicName}" : ""}',
+                          style: AppTextStyles.caption,
+                        ),
                       ],
                     ),
             ),
@@ -268,8 +402,7 @@ class _LabWalkinOrderScreenState
               backgroundColor: AppColors.info.withOpacity(.12),
               labelStyle: const TextStyle(
                   color: AppColors.info, fontSize: 12),
-              side: BorderSide(
-                  color: AppColors.info.withOpacity(.4)),
+              side: BorderSide(color: AppColors.info.withOpacity(.4)),
               deleteIcon: const Icon(Icons.close, size: 14),
               onDeleted: () =>
                   setState(() => _selectedTests.remove(t)),
@@ -292,108 +425,479 @@ class _LabWalkinOrderScreenState
   }
 }
 
-// -----------------------------------------------------------------
-// Walk-in patient picker
-// -----------------------------------------------------------------
-class _WalkInPatientPickerScreen extends ConsumerStatefulWidget {
-  final String clinicId;
-  const _WalkInPatientPickerScreen({required this.clinicId});
+// =====================================================================
+// CUSTOMER PICKER — three-mode: lookup linked / direct / link direct
+// =====================================================================
+class _CustomerPickerScreen extends ConsumerStatefulWidget {
+  final String labClinicId;
+  final String labName;
+  final LabCustomerService customerSvc;
+
+  const _CustomerPickerScreen({
+    required this.labClinicId,
+    required this.labName,
+    required this.customerSvc,
+  });
 
   @override
-  ConsumerState<_WalkInPatientPickerScreen> createState() =>
-      _WalkInPatientPickerScreenState();
+  ConsumerState<_CustomerPickerScreen> createState() =>
+      _CustomerPickerScreenState();
 }
 
-class _WalkInPatientPickerScreenState
-    extends ConsumerState<_WalkInPatientPickerScreen> {
-  final _search = TextEditingController();
-  String _q = '';
+class _CustomerPickerScreenState
+    extends ConsumerState<_CustomerPickerScreen> {
+  final _searchCtrl = TextEditingController();
+  bool _searching = false;
+  String? _query;
+  List<PatientModel> _clinicMatches = const [];
+  List<LabCustomerModel> _labMatches = const [];
+  bool _searched = false;
+
+  Map<String, String> _clinicNames = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _loadClinicNames();
+  }
+
+  Future<void> _loadClinicNames() async {
+    try {
+      final user = await ref.read(currentUserProvider.future);
+      if (user?.clinicId == null) return;
+      final linked = await ref
+          .read(labServiceProvider)
+          .watchLinkedClinics(user!.clinicId!)
+          .first;
+      final map = <String, String>{};
+      for (final l in linked) {
+        final cid = (l['clinicId'] ?? '').toString();
+        final cname =
+            (l['clinicName'] ?? l['labName'] ?? '').toString();
+        if (cid.isNotEmpty && cname.isNotEmpty) map[cid] = cname;
+      }
+      if (mounted) setState(() => _clinicNames = map);
+    } catch (_) {
+      // Silent — fall back to raw ID if this fails.
+    }
+  }
+
+  String _clinicLabel(String? clinicId) {
+    if (clinicId == null || clinicId.isEmpty) return '';
+    return _clinicNames[clinicId] ?? clinicId;
+  }
 
   @override
   void dispose() {
-    _search.dispose();
+    _searchCtrl.dispose();
     super.dispose();
+  }
+
+  Future<void> _search() async {
+    final q = _searchCtrl.text.trim();
+    if (q.isEmpty) return;
+
+    setState(() {
+      _searching = true;
+      _query = q;
+    });
+    try {
+      final clinicResults = await widget.customerSvc
+          .findLinkedPatients(labClinicId: widget.labClinicId, query: q);
+      final labResults = await widget.customerSvc
+          .findLabCustomersByPhone(
+              labClinicId: widget.labClinicId, phone: q);
+      if (mounted) {
+        setState(() {
+          _clinicMatches = clinicResults;
+          _labMatches = labResults;
+          _searched = true;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+              content: Text('Search failed: $e'),
+              backgroundColor: AppColors.error),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _searching = false);
+    }
+  }
+
+  Future<void> _pickClinicPatient(PatientModel p) async {
+    final clinicName = _clinicLabel(p.clinicId);
+
+    try {
+      final customer = await widget.customerSvc.upsertClinicLinked(
+        labClinicId: widget.labClinicId,
+        sourceClinicId: p.clinicId ?? '',
+        sourceClinicName: clinicName,
+        sourcePatientDocId: p.docId,
+        sourcePatientId: p.patientId,
+        fullName: p.fullName,
+        phone: p.phone,
+        gender: p.gender,
+        email: p.email,
+        dob: p.dob,
+        bloodGroup: p.bloodGroup,
+      );
+      if (mounted) Navigator.of(context).pop(customer);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+              content: Text('Failed: $e'),
+              backgroundColor: AppColors.error),
+        );
+      }
+    }
+  }
+
+  Future<void> _pickLabCustomer(LabCustomerModel c) async {
+    if (mounted) Navigator.of(context).pop(c);
+  }
+
+  Future<void> _createDirect() async {
+    final created = await showModalBottomSheet<LabCustomerModel>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _NewDirectCustomerSheet(
+        labClinicId: widget.labClinicId,
+        customerSvc: widget.customerSvc,
+        initialPhone: _query ?? '',
+      ),
+    );
+    if (created != null && mounted) Navigator.of(context).pop(created);
   }
 
   @override
   Widget build(BuildContext context) {
-    final patientsAsync =
-        ref.watch(_patientsForClinicProvider(widget.clinicId));
     return Scaffold(
       backgroundColor: AppColors.background,
-      appBar: AppBar(title: const Text('Select Patient')),
+      appBar: AppBar(
+        title: const Text('Find or create customer'),
+        actions: [
+          IconButton(
+            tooltip: 'New walk-in',
+            icon: const Icon(Icons.person_add_alt_1_rounded),
+            onPressed: _createDirect,
+          ),
+        ],
+      ),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
             TextField(
-              controller: _search,
-              onChanged: (v) => setState(() => _q = v.trim()),
+              controller: _searchCtrl,
+              onSubmitted: (_) => _search(),
+              keyboardType: TextInputType.text,
               style: const TextStyle(color: AppColors.textPrimary),
-              decoration: const InputDecoration(
-                hintText: 'Search by name or PT-...',
+              decoration: InputDecoration(
+                hintText: 'Search by phone or email',
                 prefixIcon:
-                    Icon(Icons.search, color: AppColors.textMuted),
+                    const Icon(Icons.search, color: AppColors.textMuted),
+                suffixIcon: IconButton(
+                  icon: const Icon(Icons.arrow_forward),
+                  onPressed: _search,
+                ),
               ),
             ),
             const SizedBox(height: 16),
             Expanded(
-              child: patientsAsync.when(
-                loading: () => const Center(
-                    child: CircularProgressIndicator(
-                        color: AppColors.primary)),
-                error: (e, _) => Center(
-                    child: Text('$e',
-                        style: const TextStyle(
-                            color: AppColors.error))),
-                data: (list) {
-                  final filtered = _q.isEmpty
-                      ? list
-                      : list.where((p) {
-                          final s = _q.toLowerCase();
-                          return p.fullName.toLowerCase().contains(s) ||
-                              p.patientId.toLowerCase().contains(s) ||
-                              p.phone.contains(_q);
-                        }).toList();
-                  if (filtered.isEmpty) {
-                    return const Center(
-                        child: Text('No patients found',
-                            style: TextStyle(
-                                color: AppColors.textMuted)));
-                  }
-                  return ListView.separated(
-                    itemCount: filtered.length,
-                    separatorBuilder: (_, __) =>
-                        const SizedBox(height: 10),
-                    itemBuilder: (_, i) {
-                      final p = filtered[i];
-                      return ListTile(
-                        tileColor: AppColors.surface,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                          side: const BorderSide(
-                              color: AppColors.cardBorder),
-                        ),
-                        leading: CircleAvatar(
-                          backgroundColor:
-                              AppColors.primary.withOpacity(.15),
+              child: _searching
+                  ? const Center(
+                      child: CircularProgressIndicator(
+                          color: AppColors.primary))
+                  : !_searched
+                      ? const Center(
                           child: Text(
-                            p.fullName.isNotEmpty
-                                ? p.fullName[0].toUpperCase()
-                                : '?',
-                            style: const TextStyle(
-                                color: AppColors.primary),
+                            'Type a phone or email to search linked-clinic patients.\nNo match? Tap the + above to create a direct customer.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(color: AppColors.textMuted),
                           ),
-                        ),
-                        title:
-                            Text(p.fullName, style: AppTextStyles.body),
-                        subtitle: Text('${p.patientId} • ${p.phone}',
-                            style: AppTextStyles.caption),
-                        onTap: () => Navigator.of(context).pop(p),
-                      );
-                    },
-                  );
-                },
+                        )
+                      : _buildResults(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildResults() {
+    if (_clinicMatches.isEmpty && _labMatches.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.person_off_rounded,
+                size: 48, color: AppColors.textMuted),
+            const SizedBox(height: 12),
+            Text('No match for "$_query"',
+                style: const TextStyle(color: AppColors.textMuted)),
+            const SizedBox(height: 16),
+            ElevatedButton.icon(
+              onPressed: _createDirect,
+              icon: const Icon(Icons.person_add_alt_1_rounded),
+              label: const Text('Create direct customer'),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return ListView(
+      children: [
+        if (_clinicMatches.isNotEmpty) ...[
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 8),
+            child: Text('Found in linked clinics',
+                style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.textSecondary)),
+          ),
+          ..._clinicMatches.map((p) => Card(
+                color: AppColors.surface,
+                child: ListTile(
+                  leading: const Icon(Icons.local_hospital_outlined,
+                      color: AppColors.info),
+                  title: Text(p.fullName, style: AppTextStyles.body),
+                  subtitle: Text(
+                    '${p.patientId} • ${p.phone}'
+                    '${p.clinicId != null && p.clinicId!.isNotEmpty ? " • ${_clinicLabel(p.clinicId)}" : ""}',
+                    style: AppTextStyles.caption,
+                  ),
+                  onTap: () => _pickClinicPatient(p),
+                ),
+              )),
+        ],
+        if (_labMatches.isNotEmpty) ...[
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 8),
+            child: Text('Already in this lab',
+                style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.textSecondary)),
+          ),
+          ..._labMatches.map((c) => Card(
+                color: AppColors.surface,
+                child: ListTile(
+                  leading: const Icon(Icons.science_outlined,
+                      color: AppColors.labAccent),
+                  title: Text(c.fullName, style: AppTextStyles.body),
+                  subtitle: Text(
+                    '${c.displayPatientId} • ${c.phone}'
+                    '${c.isClinicLinked ? " • from ${c.sourceClinicName}" : " • direct"}',
+                    style: AppTextStyles.caption,
+                  ),
+                  onTap: () => _pickLabCustomer(c),
+                ),
+              )),
+        ],
+      ],
+    );
+  }
+}
+
+// =====================================================================
+// NEW DIRECT CUSTOMER FORM — email is required (needed for patient
+// signup to match this record)
+// =====================================================================
+class _NewDirectCustomerSheet extends StatefulWidget {
+  final String labClinicId;
+  final LabCustomerService customerSvc;
+  final String initialPhone;
+
+  const _NewDirectCustomerSheet({
+    required this.labClinicId,
+    required this.customerSvc,
+    required this.initialPhone,
+  });
+
+  @override
+  State<_NewDirectCustomerSheet> createState() =>
+      _NewDirectCustomerSheetState();
+}
+
+class _NewDirectCustomerSheetState
+    extends State<_NewDirectCustomerSheet> {
+  final _nameCtrl = TextEditingController();
+  final _phoneCtrl = TextEditingController();
+  final _emailCtrl = TextEditingController();
+  final _referredDoctorCtrl = TextEditingController();
+  final _referredClinicCtrl = TextEditingController();
+  String _gender = 'male';
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _phoneCtrl.text = widget.initialPhone;
+  }
+
+  @override
+  void dispose() {
+    _nameCtrl.dispose();
+    _phoneCtrl.dispose();
+    _emailCtrl.dispose();
+    _referredDoctorCtrl.dispose();
+    _referredClinicCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    final name = _nameCtrl.text.trim();
+    final phone = _phoneCtrl.text.trim();
+    final email = _emailCtrl.text.trim();
+
+    if (name.length < 3) {
+      _snack('Enter a full name (min 3 characters).');
+      return;
+    }
+    if (phone.length < 6) {
+      _snack('Enter a valid phone.');
+      return;
+    }
+    if (email.isEmpty || !email.contains('@') || !email.contains('.')) {
+      _snack('Enter a valid email. The patient needs this to sign up '
+          'and view their reports.');
+      return;
+    }
+
+    setState(() => _saving = true);
+    try {
+      final c = await widget.customerSvc.createDirect(
+        labClinicId: widget.labClinicId,
+        fullName: name,
+        phone: phone,
+        gender: _gender,
+        email: email,
+        referredByName: _referredDoctorCtrl.text.trim().isEmpty
+            ? null
+            : _referredDoctorCtrl.text.trim(),
+        referredByClinicName: _referredClinicCtrl.text.trim().isEmpty
+            ? null
+            : _referredClinicCtrl.text.trim(),
+      );
+      if (mounted) Navigator.of(context).pop(c);
+    } catch (e) {
+      _snack('Failed: $e');
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(msg), backgroundColor: AppColors.error),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DraggableScrollableSheet(
+      initialChildSize: 0.85,
+      minChildSize: 0.6,
+      maxChildSize: 0.95,
+      expand: false,
+      builder: (_, scrollCtrl) => Container(
+        decoration: const BoxDecoration(
+          color: AppColors.background,
+          borderRadius:
+              BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        child: Column(
+          children: [
+            const SizedBox(height: 12),
+            Container(
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: AppColors.cardBorder,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: Row(children: [
+                Text('New direct customer', style: AppTextStyles.h3),
+                const Spacer(),
+                TextButton(
+                  onPressed: _saving ? null : _save,
+                  child: const Text('Save'),
+                ),
+              ]),
+            ),
+            const SizedBox(height: 8),
+            Expanded(
+              child: ListView(
+                controller: scrollCtrl,
+                padding: const EdgeInsets.all(20),
+                children: [
+                  LabeledField(
+                    label: 'Full name',
+                    required: true,
+                    child: DarkTextField(
+                      controller: _nameCtrl,
+                      hint: 'e.g. Rahul Mehta',
+                    ),
+                  ),
+                  LabeledField(
+                    label: 'Phone',
+                    required: true,
+                    child: DarkTextField(
+                      controller: _phoneCtrl,
+                      hint: 'e.g. 9545831585',
+                    ),
+                  ),
+                  LabeledField(
+                    label: 'Email',
+                    required: true,
+                    child: DarkTextField(
+                      controller: _emailCtrl,
+                      hint: 'e.g. rahul@gmail.com',
+                    ),
+                  ),
+                  LabeledField(
+                    label: 'Gender',
+                    required: true,
+                    child: DropdownButtonFormField<String>(
+                      value: _gender,
+                      dropdownColor: AppColors.surfaceElevated,
+                      items: const [
+                        DropdownMenuItem(
+                            value: 'male', child: Text('Male')),
+                        DropdownMenuItem(
+                            value: 'female', child: Text('Female')),
+                        DropdownMenuItem(
+                            value: 'other', child: Text('Other')),
+                      ],
+                      onChanged: (v) =>
+                          setState(() => _gender = v ?? 'male'),
+                    ),
+                  ),
+                  LabeledField(
+                    label: 'Referred by doctor (optional, free text)',
+                    child: DarkTextField(
+                      controller: _referredDoctorCtrl,
+                      hint: 'e.g. Dr. Anil Shah',
+                    ),
+                  ),
+                  LabeledField(
+                    label: 'Referred by clinic (optional, free text)',
+                    child: DarkTextField(
+                      controller: _referredClinicCtrl,
+                      hint: 'e.g. Sunrise Hospital',
+                    ),
+                  ),
+                ],
               ),
             ),
           ],
@@ -403,17 +907,9 @@ class _WalkInPatientPickerScreenState
   }
 }
 
-final _patientsForClinicProvider = StreamProvider.autoDispose
-    .family<List<PatientModel>, String>((ref, clinicId) {
-  return ref.read(patientServiceProvider).watchPatients(
-        clinicId: clinicId,
-      );
-});
-
-// -----------------------------------------------------------------
-// Catalog picker — selects LabTestModel objects directly.
-// No dependency on an `id` field.
-// -----------------------------------------------------------------
+// =====================================================================
+// CATALOG PICKER — selects LabTestModel objects directly.
+// =====================================================================
 class _LabCatalogPickerSheet extends StatefulWidget {
   final List<LabTestModel> allTests;
   final List<LabTestModel> preselected;
@@ -428,8 +924,7 @@ class _LabCatalogPickerSheet extends StatefulWidget {
       _LabCatalogPickerSheetState();
 }
 
-class _LabCatalogPickerSheetState
-    extends State<_LabCatalogPickerSheet> {
+class _LabCatalogPickerSheetState extends State<_LabCatalogPickerSheet> {
   late final List<LabTestModel> _selected;
   final _search = TextEditingController();
   String _q = '';
@@ -492,8 +987,7 @@ class _LabCatalogPickerSheetState
             ),
             const SizedBox(height: 16),
             Padding(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 20),
+              padding: const EdgeInsets.symmetric(horizontal: 20),
               child: Row(children: [
                 Text('Select tests', style: AppTextStyles.h3),
                 const Spacer(),
@@ -503,8 +997,7 @@ class _LabCatalogPickerSheetState
             ),
             const SizedBox(height: 12),
             Padding(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 20),
+              padding: const EdgeInsets.symmetric(horizontal: 20),
               child: TextField(
                 controller: _search,
                 onChanged: (v) => setState(() => _q = v.trim()),

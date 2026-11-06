@@ -347,6 +347,43 @@ Future<void> markFeesPaid({
     });
   }
 
+  /// Creates a walk-in appointment and immediately starts the
+  /// consultation. Used by the doctor's "Emergency patient" flow.
+  ///
+  /// Sets `type: 'walk_in'` so it's distinguishable from scheduled
+  /// appointments, and transitions to `inConsult` in the same call
+  /// so the doctor lands directly in the consultation screen.
+  Future<AppointmentModel> bookWalkInConsultation({
+    required String clinicId,
+    required String patientDocId,
+    required String patientId,
+    required String patientName,
+    required String patientPhone,
+    required String doctorDocId,
+    required String doctorName,
+    String? chiefComplaint,
+  }) async {
+    final now = DateTime.now();
+    final period = AppointmentModel.periodFromHour(now.hour);
+
+    final appt = await bookAppointment(
+      clinicId: clinicId,
+      patientDocId: patientDocId,
+      patientId: patientId,
+      patientName: patientName,
+      patientPhone: patientPhone,
+      doctorDocId: doctorDocId,
+      doctorName: doctorName,
+      slot: now,
+      slotPeriod: period,
+      chiefComplaint: chiefComplaint,
+      type: 'walk_in',
+    );
+
+    await startConsult(appt.docId);
+
+    return appt.copyWith(status: AppointmentStatus.inConsult);
+  }
 
 
 

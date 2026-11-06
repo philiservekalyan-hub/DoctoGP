@@ -6,23 +6,86 @@ class LabTestItem {
   final String? code;
   final String name;
   final String? notes;
+  final double? unitPrice;
 
-  LabTestItem({this.code, required this.name, this.notes});
+  LabTestItem({this.code, required this.name, this.notes, this.unitPrice});
 
   Map<String, dynamic> toMap() => {
         if (code != null && code!.isNotEmpty) 'code': code,
         'name': name,
         if (notes != null && notes!.isNotEmpty) 'notes': notes,
+        if (unitPrice != null) 'unitPrice': unitPrice,
       };
 
   factory LabTestItem.fromMap(Map<String, dynamic> m) => LabTestItem(
         code: m['code']?.toString(),
         name: (m['name'] ?? '').toString(),
         notes: m['notes']?.toString(),
+        unitPrice: (m['unitPrice'] as num?)?.toDouble(),
       );
 
   String get label =>
       (code != null && code!.isNotEmpty) ? '$code — $name' : name;
+}
+
+/// One group of tests in a lab order that share a sample type.
+/// E.g. all blood tests → one group with sampleType 'blood'.
+/// Each group yields one tube (and one label) by default.
+class SampleGroup {
+  final String sampleType;
+  final String barcodeSuffix;
+  final List<String> testCodes;
+  final int tubeCount;
+  final List<String> sampleIds;
+  final List<DateTime> printedAt;
+
+  SampleGroup({
+    required this.sampleType,
+    required this.barcodeSuffix,
+    required this.testCodes,
+    this.tubeCount = 1,
+    required this.sampleIds,
+    this.printedAt = const [],
+  });
+
+  Map<String, dynamic> toMap() => {
+        'sampleType': sampleType,
+        'barcodeSuffix': barcodeSuffix,
+        'tests': testCodes,
+        'tubeCount': tubeCount,
+        'sampleIds': sampleIds,
+        'printedAt': printedAt
+            .map((d) => Timestamp.fromDate(d))
+            .toList(),
+      };
+
+  factory SampleGroup.fromMap(Map<String, dynamic> m) {
+    DateTime? parse(dynamic v) {
+      if (v is Timestamp) return v.toDate();
+      if (v is DateTime) return v;
+      if (v is String) return DateTime.tryParse(v);
+      return null;
+    }
+
+    return SampleGroup(
+      sampleType: (m['sampleType'] ?? 'other').toString(),
+      barcodeSuffix: (m['barcodeSuffix'] ?? '').toString(),
+      testCodes: ((m['tests'] as List?) ?? const [])
+          .map((e) => e.toString())
+          .toList(),
+      tubeCount: (m['tubeCount'] as num?)?.toInt() ?? 1,
+      sampleIds: ((m['sampleIds'] as List?) ?? const [])
+          .map((e) => e.toString())
+          .toList(),
+      printedAt: ((m['printedAt'] as List?) ?? const [])
+          .map(parse)
+          .whereType<DateTime>()
+          .toList(),
+    );
+  }
+
+  String get testsSummary =>
+      testCodes.isEmpty ? 'Lab test' : testCodes.join(', ');
 }
 
 enum LabOrderStatus {
@@ -37,17 +100,11 @@ enum LabOrderStatus {
   unknown,
 }
 
-// ── Patient-paid lab order lifecycle (Model A) ──
 enum LabPaymentStatus { unpaid, paid, waived }
 
 class LabOrderModel {
   final String docId;
 
-  // Two-sided link — where the order came from and where it goes.
-  //
-  // `referringClinicId`, `doctorDocId`, and `doctorName` are null for
-  // walk-in orders (patient came to the lab directly, no clinic or
-  // doctor referred them).
   final String? referringClinicId;
   final String labClinicId;
   final String labName;
@@ -86,24 +143,17 @@ class LabOrderModel {
   final String? reportStoragePath;
   final DateTime? reportUploadedAt;
 
-  // ── Report release control ──
-  //
-  // The lab technician uploads the report and sets status = `ready`,
-  // but the report is NOT visible to the patient or the referring
-  // doctor until the lab receptionist has verified payment and
-  // explicitly released it (`released == true`).
-  //
-  // Before this field existed, `status == ready` implied the report
-  // was final and visible. That coupling is now broken: `released`
-  // is the gate on visibility, `status` is the pipeline stage.
-  //
-  // Existing lab orders deserialize with `released == false` —
-  // receptionists should review and release them manually.
+  final String? labCustomerDocId;
+  final String? customerSource;
+  final String? referralType;
+
+  /// NEW — per-sample-type tube groups with barcode IDs.
+  final List<SampleGroup> sampleGroups;
+
   final bool released;
   final DateTime? releasedAt;
   final String? releasedByUid;
 
-  // ── Patient-facing billing (Model A) ──
   final double? billableAmount;
   final LabPaymentStatus paymentStatus;
   final DateTime? feesPaidAt;
@@ -148,27 +198,33 @@ class LabOrderModel {
     this.paymentStatus = LabPaymentStatus.unpaid,
     this.feesPaidAt,
     this.feesCollectedByUid,
+    this.labCustomerDocId,
+    this.customerSource,
+    this.referralType,
+    this.sampleGroups = const [],
   });
 
   bool get isWalkIn =>
       (referringClinicId == null || referringClinicId!.isEmpty) &&
       (doctorDocId == null || doctorDocId!.isEmpty);
 
-  /// True if the report has been uploaded by the technician but not
-  /// yet released by the receptionist.
-  ///
-  /// This is the state a receptionist uses to see "reports awaiting
-  /// payment check" on their dashboard. It's the ONLY state in which
-  /// the report is invisible to the patient and referring doctor.
   bool get awaitingRelease =>
       status == LabOrderStatus.ready && !released;
 
-  /// True if the report is uploaded AND released — meaning the
-  /// patient and referring doctor can see it.
   bool get reportVisible =>
       status == LabOrderStatus.ready &&
       released &&
       (reportUrl?.isNotEmpty ?? false);
+
+  bool get priceMissing => (billableAmount ?? 0) <= 0;
+
+  /// Flat list of all sample IDs across all groups.
+  List<String> get allSampleIds =>
+      sampleGroups.expand((g) => g.sampleIds).toList();
+
+  /// True if any group has fewer printed labels than sample IDs.
+  bool get hasUnprintedSamples =>
+      sampleGroups.any((g) => g.printedAt.length < g.sampleIds.length);
 
   static LabOrderStatus _parseStatus(dynamic v) {
     switch ('${v ?? ''}'.toLowerCase()) {
@@ -264,6 +320,13 @@ class LabOrderModel {
       paymentStatus: _parsePayment(m['paymentStatus']),
       feesPaidAt: _date(m['feesPaidAt']),
       feesCollectedByUid: m['feesCollectedByUid']?.toString(),
+      labCustomerDocId: m['labCustomerDocId']?.toString(),
+      customerSource: m['customerSource']?.toString(),
+      referralType: m['referralType']?.toString(),
+      sampleGroups: ((m['sampleGroups'] as List?) ?? const [])
+          .map((e) => SampleGroup.fromMap(
+              Map<String, dynamic>.from(e as Map)))
+          .toList(),
     );
   }
 

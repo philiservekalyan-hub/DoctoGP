@@ -70,3 +70,13 @@ node_modules/
 
 build/
 .dart_tool/
+
+# Flutter/Dart
+.dart_tool/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+*.iml

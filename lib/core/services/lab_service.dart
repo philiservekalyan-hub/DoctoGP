@@ -4,9 +4,12 @@ import 'package:firebase_auth/firebase_auth.dart';
 
 import '../models/lab_order_model.dart';
 import '../models/lab_test_model.dart';
+import '../models/lab_customer_model.dart';
+import 'lab_customer_service.dart';
 
 class LabService {
   final _db = FirebaseFirestore.instance;
+  final _labCustomerService = LabCustomerService();
 
   CollectionReference<Map<String, dynamic>> get _orders =>
       _db.collection('labOrders');
@@ -17,9 +20,14 @@ class LabService {
   CollectionReference<Map<String, dynamic>> _testsFor(String labClinicId) =>
       _clinics.doc(labClinicId).collection('labTests');
 
+  CollectionReference<Map<String, dynamic>> _packagesFor(
+          String labClinicId) =>
+      _clinics.doc(labClinicId).collection('labPackages');
+
   // =================================================================
-  // LINK MANAGEMENT (admin only)
+  // LINK MANAGEMENT
   // =================================================================
+
   Future<void> linkClinicAndLab({
     required String clinicId,
     required String clinicName,
@@ -102,8 +110,9 @@ class LabService {
   }
 
   // =================================================================
-  // CATALOGS
+  // CATALOG READS
   // =================================================================
+
   Stream<List<({String labClinicId, String labName, List<dynamic> tests})>>
       watchLinkedCatalogs(String referringClinicId) {
     return watchLinkedLabs(referringClinicId).asyncMap((linked) async {
@@ -126,9 +135,6 @@ class LabService {
     });
   }
 
-  // =================================================================
-  // LAB TEST CATALOG CRUD
-  // =================================================================
   Stream<List<LabTestModel>> watchLabTests({
     required String labClinicId,
     bool includeInactive = false,
@@ -137,10 +143,66 @@ class LabService {
     if (!includeInactive) {
       q = q.where('active', isEqualTo: true);
     }
-    return q.orderBy('code').snapshots().map((s) => s.docs
-        .map((d) => LabTestModel.fromMap(d.id, d.data()))
-        .toList());
+    return q.snapshots().asyncMap((s) async {
+      final docs = s.docs;
+
+      final testIds = <String>{
+        for (final d in docs)
+          if ((d.data()['isLocal'] != true) &&
+              (d.data()['testId'] != null) &&
+              d.data()['testId'].toString().isNotEmpty)
+            d.data()['testId'].toString(),
+      };
+
+      final canonicalMap = <String, Map<String, dynamic>>{};
+      final ids = testIds.toList();
+      for (var i = 0; i < ids.length; i += 30) {
+        final chunk = ids.sublist(
+          i, (i + 30) > ids.length ? ids.length : i + 30,
+        );
+        final snap = await _db
+            .collection('tests')
+            .where(FieldPath.documentId, whereIn: chunk)
+            .get();
+        for (final doc in snap.docs) {
+          canonicalMap[doc.id] = doc.data();
+        }
+      }
+
+      final list = docs.map((d) {
+        final raw = Map<String, dynamic>.from(d.data());
+        final isLocal = raw['isLocal'] == true;
+        final testId = raw['testId']?.toString();
+
+        if (!isLocal && testId != null && canonicalMap.containsKey(testId)) {
+          final c = canonicalMap[testId]!;
+          raw['code'] = c['code'];
+          raw['name'] = c['name'];
+          raw['category'] = c['category'];
+          raw['sampleType'] = c['sampleType'];
+          raw['fastingRequired'] = c['fastingRequired'] == true;
+        } else if (isLocal) {
+          raw['code'] = raw['localCode'];
+          raw['name'] = raw['localName'];
+          raw['category'] = raw['localCategory'];
+          raw['sampleType'] = raw['localSampleType'];
+          raw['fastingRequired'] = raw['localFastingRequired'] == true;
+        }
+        return LabTestModel.fromMap(d.id, raw);
+      }).toList()
+        ..sort((a, b) {
+          final byCat = a.category.compareTo(b.category);
+          if (byCat != 0) return byCat;
+          return a.code.compareTo(b.code);
+        });
+
+      return list;
+    });
   }
+
+  // =================================================================
+  // LEGACY FREE-FORM TEST CRUD
+  // =================================================================
 
   Future<String> createLabTest({
     required String labClinicId,
@@ -227,32 +289,534 @@ class LabService {
     await _rebuildDenormalizedCatalog(labClinicId);
   }
 
+  // =================================================================
+  // CANONICAL OFFERINGS, LOCAL TESTS, PACKAGES
+  // =================================================================
+
+  Future<void> addOfferings({
+    required String labClinicId,
+    required List<String> testIds,
+  }) async {
+    if (testIds.isEmpty) return;
+
+    final user = FirebaseAuth.instance.currentUser;
+
+    final unique = <String>{};
+    for (final id in testIds) {
+      if (id.isNotEmpty) unique.add(id);
+    }
+    if (unique.isEmpty) return;
+
+    final existing = await _testsFor(labClinicId).get();
+    final existingCanonical = <String>{
+      for (final d in existing.docs)
+        if (d.data()['isLocal'] != true)
+          (d.data()['testId'] ?? '').toString(),
+    }..remove('');
+
+    final toAdd = unique.difference(existingCanonical).toList();
+    if (toAdd.isEmpty) return;
+
+    final canonicalMap = <String, Map<String, dynamic>>{};
+    for (var i = 0; i < toAdd.length; i += 30) {
+      final chunk = toAdd.sublist(
+        i, (i + 30) > toAdd.length ? toAdd.length : i + 30,
+      );
+      final snap = await _db
+          .collection('tests')
+          .where(FieldPath.documentId, whereIn: chunk)
+          .get();
+      for (final doc in snap.docs) {
+        canonicalMap[doc.id] = doc.data();
+      }
+    }
+
+    final batch = _db.batch();
+    var added = 0;
+    for (final testId in toAdd) {
+      if (!canonicalMap.containsKey(testId)) continue;
+
+      final docRef = _testsFor(labClinicId).doc(testId);
+      batch.set(docRef, {
+        'testId': testId,
+        'isLocal': false,
+        'mrp': null,
+        'offerPrice': null,
+        'turnaroundHours': null,
+        'deptId': null,
+        'displayName': null,
+        'notes': null,
+        'active': false,
+        'createdAt': FieldValue.serverTimestamp(),
+        'createdByUid': user?.uid,
+        'createdByEmail': user?.email,
+        'updatedAt': FieldValue.serverTimestamp(),
+        'updatedByUid': user?.uid,
+      });
+      added++;
+    }
+
+    if (added == 0) return;
+
+    await batch.commit();
+    await _rebuildDenormalizedCatalog(labClinicId);
+  }
+
+  Future<Set<String>> whichTestIdsAlreadyExist({
+    required String labClinicId,
+    required List<String> testIds,
+  }) async {
+    if (testIds.isEmpty) return const {};
+    final snap = await _testsFor(labClinicId).get();
+    final existing = <String>{
+      for (final d in snap.docs)
+        if (d.data()['isLocal'] != true)
+          (d.data()['testId'] ?? '').toString(),
+    }..remove('');
+    return testIds.where(existing.contains).toSet();
+  }
+
+  Future<void> createLocalTest({
+    required String labClinicId,
+    required String code,
+    required String name,
+    required String category,
+    required String sampleType,
+    bool fastingRequired = false,
+    int? turnaroundHours,
+    required double mrp,
+    double? offerPrice,
+    String? notes,
+  }) async {
+    final effectiveOffer = offerPrice ?? mrp;
+    if (effectiveOffer > mrp) {
+      throw ArgumentError('Offer price cannot exceed MRP.');
+    }
+
+    final upperCode = code.trim().toUpperCase();
+    if (upperCode.isEmpty) {
+      throw ArgumentError('Local test code is required.');
+    }
+
+    final existing = await _testsFor(labClinicId).get();
+    final canonicalTestIds = <String>[];
+    for (final d in existing.docs) {
+      final m = d.data();
+      if (m['isLocal'] == true) {
+        final existingCode =
+            (m['localCode'] ?? '').toString().toUpperCase();
+        if (existingCode == upperCode) {
+          throw StateError(
+            'A local test with code "$upperCode" already exists in your catalogue.',
+          );
+        }
+      } else {
+        final testId = (m['testId'] ?? '').toString();
+        if (testId.isNotEmpty) canonicalTestIds.add(testId);
+      }
+    }
+
+    for (var i = 0; i < canonicalTestIds.length; i += 30) {
+      final chunk = canonicalTestIds.sublist(
+        i,
+        (i + 30) > canonicalTestIds.length
+            ? canonicalTestIds.length
+            : i + 30,
+      );
+      final snap = await _db
+          .collection('tests')
+          .where(FieldPath.documentId, whereIn: chunk)
+          .get();
+      for (final doc in snap.docs) {
+        final cCode =
+            (doc.data()['code'] ?? '').toString().toUpperCase();
+        if (cCode == upperCode) {
+          throw StateError(
+            'A test with code "$upperCode" already exists in your catalogue '
+            '(from the master dictionary).',
+          );
+        }
+      }
+    }
+
+    final user = FirebaseAuth.instance.currentUser;
+    final docRef = _testsFor(labClinicId).doc();
+    await docRef.set({
+      'testId': null,
+      'isLocal': true,
+      'localCode': upperCode,
+      'localName': name.trim(),
+      'localCategory': category,
+      'localSampleType': sampleType,
+      'localFastingRequired': fastingRequired,
+      'mrp': mrp,
+      'offerPrice': effectiveOffer,
+      'turnaroundHours': turnaroundHours,
+      'deptId': null,
+      'displayName': null,
+      'notes': notes,
+      'active': true,
+      'createdAt': FieldValue.serverTimestamp(),
+      'createdByUid': user?.uid,
+      'createdByEmail': user?.email,
+      'updatedAt': FieldValue.serverTimestamp(),
+      'updatedByUid': user?.uid,
+    });
+    await _rebuildDenormalizedCatalog(labClinicId);
+  }
+
+  Future<void> updateOffering({
+    required String labClinicId,
+    required String offeringId,
+    required double mrp,
+    double? offerPrice,
+    int? turnaroundHours,
+    bool? active,
+    String? notes,
+  }) async {
+    final effectiveOffer = offerPrice ?? mrp;
+    if (effectiveOffer > mrp) {
+      throw ArgumentError('Offer price cannot exceed MRP.');
+    }
+    final user = FirebaseAuth.instance.currentUser;
+    final data = <String, dynamic>{
+      'mrp': mrp,
+      'offerPrice': effectiveOffer,
+      'updatedAt': FieldValue.serverTimestamp(),
+      'updatedByUid': user?.uid,
+    };
+    if (turnaroundHours != null) {
+      data['turnaroundHours'] = turnaroundHours;
+    }
+    if (active != null) data['active'] = active;
+    if (notes != null) data['notes'] = notes;
+    await _testsFor(labClinicId).doc(offeringId).update(data);
+    await _rebuildDenormalizedCatalog(labClinicId);
+  }
+
+  Future<void> setOfferingActive({
+    required String labClinicId,
+    required String offeringId,
+    required bool active,
+  }) async {
+    final user = FirebaseAuth.instance.currentUser;
+    await _testsFor(labClinicId).doc(offeringId).update({
+      'active': active,
+      'updatedAt': FieldValue.serverTimestamp(),
+      'updatedByUid': user?.uid,
+    });
+    await _rebuildDenormalizedCatalog(labClinicId);
+  }
+
+  Future<void> removeOffering({
+    required String labClinicId,
+    required String offeringId,
+  }) async {
+    await _testsFor(labClinicId).doc(offeringId).delete();
+    await _rebuildDenormalizedCatalog(labClinicId);
+  }
+
+  Future<void> createPackage({
+    required String labClinicId,
+    required String name,
+    String? description,
+    required List<String> offeringIds,
+    int? turnaroundHours,
+    String? notes,
+  }) async {
+    if (offeringIds.isEmpty) {
+      throw ArgumentError('Package must contain at least one test.');
+    }
+    final user = FirebaseAuth.instance.currentUser;
+    final docRef = _packagesFor(labClinicId).doc();
+    await docRef.set({
+      'name': name.trim(),
+      'description': description?.trim(),
+      'includedTestOfferingIds': offeringIds,
+      'includedTestSummary': '',
+      'computedMrp': null,
+      'computedOfferPrice': null,
+      'computedDiscount': null,
+      'computedDiscountPercent': null,
+      'turnaroundHours': turnaroundHours,
+      'notes': notes,
+      'active': true,
+      'createdAt': FieldValue.serverTimestamp(),
+      'createdByUid': user?.uid,
+      'createdByEmail': user?.email,
+      'updatedAt': FieldValue.serverTimestamp(),
+      'updatedByUid': user?.uid,
+    });
+    await _rebuildDenormalizedCatalog(labClinicId);
+  }
+
+  Future<void> updatePackage({
+    required String labClinicId,
+    required String packageId,
+    required String name,
+    String? description,
+    required List<String> offeringIds,
+    int? turnaroundHours,
+    bool? active,
+    String? notes,
+  }) async {
+    final user = FirebaseAuth.instance.currentUser;
+    final data = <String, dynamic>{
+      'name': name.trim(),
+      'description': description?.trim(),
+      'includedTestOfferingIds': offeringIds,
+      'turnaroundHours': turnaroundHours,
+      'notes': notes,
+      'updatedAt': FieldValue.serverTimestamp(),
+      'updatedByUid': user?.uid,
+    };
+    if (active != null) data['active'] = active;
+    await _packagesFor(labClinicId).doc(packageId).update(data);
+    await _rebuildDenormalizedCatalog(labClinicId);
+  }
+
+  Future<void> deletePackage({
+    required String labClinicId,
+    required String packageId,
+  }) async {
+    await _packagesFor(labClinicId).doc(packageId).delete();
+    await _rebuildDenormalizedCatalog(labClinicId);
+  }
+
+  Stream<List<Map<String, dynamic>>> watchPackages(String labClinicId) {
+    return _packagesFor(labClinicId)
+        .where('active', isEqualTo: true)
+        .snapshots()
+        .map((s) => s.docs
+            .map((d) => <String, dynamic>{'packageId': d.id, ...d.data()})
+            .toList());
+  }
+
+  // =================================================================
+  // DENORMALIZED CATALOG REBUILD
+  // =================================================================
+
   Future<void> _rebuildDenormalizedCatalog(String labClinicId) async {
-    final snap = await _testsFor(labClinicId)
+    final offeringsSnap =
+        await _testsFor(labClinicId).where('active', isEqualTo: true).get();
+    final packagesSnap = await _packagesFor(labClinicId)
         .where('active', isEqualTo: true)
         .get();
 
-    final tests = snap.docs.map((d) {
-      final m = d.data();
-      return {
-        'code': (m['code'] ?? '').toString(),
-        'name': (m['name'] ?? '').toString(),
-        'category': (m['category'] ?? 'Other').toString(),
-        'sampleType': (m['sampleType'] ?? 'Blood').toString(),
-        'fastingRequired': m['fastingRequired'] == true,
-        'turnaroundHours': m['turnaroundHours'],
-        'searchKey': (m['searchKey'] ?? '').toString(),
-        'searchTokens': m['searchTokens'] ?? const [],
-      };
-    }).toList();
+    final testIds = <String>{
+      for (final d in offeringsSnap.docs)
+        if ((d.data()['testId'] ?? '').toString().isNotEmpty)
+          d.data()['testId'].toString(),
+    };
+    final canonicalMap = <String, Map<String, dynamic>>{};
+    final testIdList = testIds.toList();
+    for (var i = 0; i < testIdList.length; i += 30) {
+      final chunk = testIdList.sublist(
+        i,
+        (i + 30) > testIdList.length ? testIdList.length : i + 30,
+      );
+      final snap = await _db
+          .collection('tests')
+          .where(FieldPath.documentId, whereIn: chunk)
+          .get();
+      for (final doc in snap.docs) {
+        canonicalMap[doc.id] = doc.data();
+      }
+    }
+
+    final merged = <Map<String, dynamic>>[];
+    final offeringById = <String, Map<String, dynamic>>{};
+
+    for (final offering in offeringsSnap.docs) {
+      final o = offering.data();
+      final isLocal = o['isLocal'] == true;
+      final testId = (o['testId'] ?? '').toString();
+
+      Map<String, dynamic>? entry;
+
+      if (isLocal) {
+        entry = {
+          'offeringId': offering.id,
+          'testId': null,
+          'isLocal': true,
+          'isPackage': false,
+          'code': (o['localCode'] ?? '').toString(),
+          'name': (o['localName'] ?? '').toString(),
+          'category': (o['localCategory'] ?? 'other').toString(),
+          'sampleType': (o['localSampleType'] ?? 'other').toString(),
+          'fastingRequired': o['localFastingRequired'] == true,
+          'loincCode': null,
+          'mrp': (o['mrp'] as num?)?.toDouble(),
+          'offerPrice': (o['offerPrice'] as num?)?.toDouble(),
+          'turnaroundHours': o['turnaroundHours'],
+          'deptId': o['deptId'],
+          'labClinicId': labClinicId,
+          'active': o['active'] != false,
+          'notes': o['notes'],
+        };
+      } else if (testId.isNotEmpty) {
+        final c = canonicalMap[testId];
+        if (c == null) continue;
+        if (c['active'] != true) continue;
+
+        final displayOverride = (o['displayName'] as String?)?.trim();
+        final effectiveName =
+            (displayOverride != null && displayOverride.isNotEmpty)
+                ? displayOverride
+                : (c['name'] ?? '').toString();
+
+        entry = {
+          'offeringId': offering.id,
+          'testId': testId,
+          'isLocal': false,
+          'isPackage': false,
+          'code': (c['code'] ?? '').toString(),
+          'name': effectiveName,
+          'category': (c['category'] ?? 'other').toString(),
+          'sampleType': (c['sampleType'] ?? 'other').toString(),
+          'fastingRequired': c['fastingRequired'] == true,
+          'loincCode': c['loincCode'],
+          'mrp': (o['mrp'] as num?)?.toDouble(),
+          'offerPrice': (o['offerPrice'] as num?)?.toDouble(),
+          'turnaroundHours': o['turnaroundHours'],
+          'deptId': o['deptId'],
+          'labClinicId': labClinicId,
+          'active': o['active'] != false,
+          'notes': o['notes'],
+        };
+      }
+
+      if (entry != null) {
+        final mrp = entry['mrp'] as double?;
+        final offer = entry['offerPrice'] as double?;
+        if (mrp != null && offer != null && mrp > 0) {
+          entry['discount'] = (mrp - offer).clamp(0, mrp);
+          entry['discountPercent'] =
+              ((mrp - offer) / mrp * 100).round();
+        } else {
+          entry['discount'] = 0.0;
+          entry['discountPercent'] = 0;
+        }
+        merged.add(entry);
+        offeringById[offering.id] = entry;
+      }
+    }
+
+    final packageEntries = <Map<String, dynamic>>[];
+    for (final pkg in packagesSnap.docs) {
+      final p = pkg.data();
+      final includedIds =
+          (p['includedTestOfferingIds'] as List?)?.cast<String>() ??
+              const <String>[];
+      final includedTests = <Map<String, dynamic>>[];
+      for (final id in includedIds) {
+        final entry = offeringById[id];
+        if (entry != null) includedTests.add(entry);
+      }
+      if (includedTests.isEmpty) continue;
+
+      double sumMrp = 0;
+      double sumOffer = 0;
+      var allHavePrice = true;
+      for (final t in includedTests) {
+        final mrp = t['mrp'] as double?;
+        final offer = t['offerPrice'] as double?;
+        if (mrp == null || offer == null) {
+          allHavePrice = false;
+          break;
+        }
+        sumMrp += mrp;
+        sumOffer += offer;
+      }
+
+      final computedMrp = allHavePrice ? sumMrp : null;
+      final computedOffer = allHavePrice ? sumOffer : null;
+      final computedDiscount = (computedMrp != null &&
+              computedOffer != null &&
+              computedMrp > 0)
+          ? (computedMrp - computedOffer).clamp(0, computedMrp)
+          : 0.0;
+      final computedDiscountPercent = (computedMrp != null &&
+              computedOffer != null &&
+              computedMrp > 0)
+          ? ((computedMrp - computedOffer) / computedMrp * 100).round()
+          : 0;
+
+      final summary = includedTests
+          .map((t) {
+            final code = (t['code'] ?? '').toString();
+            final name = (t['name'] ?? '').toString();
+            return code.isNotEmpty ? code : name;
+          })
+          .where((s) => s.isNotEmpty)
+          .join(', ');
+
+      final patch = <String, dynamic>{};
+      if (p['includedTestSummary'] != summary) {
+        patch['includedTestSummary'] = summary;
+      }
+      if (p['computedMrp'] != computedMrp) {
+        patch['computedMrp'] = computedMrp;
+      }
+      if (p['computedOfferPrice'] != computedOffer) {
+        patch['computedOfferPrice'] = computedOffer;
+      }
+      if (p['computedDiscount'] != computedDiscount) {
+        patch['computedDiscount'] = computedDiscount;
+      }
+      if (p['computedDiscountPercent'] != computedDiscountPercent) {
+        patch['computedDiscountPercent'] = computedDiscountPercent;
+      }
+      if (patch.isNotEmpty) {
+        await _packagesFor(labClinicId).doc(pkg.id).update(patch);
+      }
+
+      packageEntries.add({
+        'packageId': pkg.id,
+        'isPackage': true,
+        'isLocal': false,
+        'code': 'PKG',
+        'name': (p['name'] ?? '').toString(),
+        'description': (p['description'] ?? '').toString(),
+        'category': 'package',
+        'sampleType': 'multiple',
+        'fastingRequired': false,
+        'mrp': computedMrp,
+        'offerPrice': computedOffer,
+        'discount': computedDiscount,
+        'discountPercent': computedDiscountPercent,
+        'turnaroundHours': p['turnaroundHours'],
+        'labClinicId': labClinicId,
+        'includedTests': includedTests,
+        'includedTestSummary': summary,
+        'active': p['active'] != false,
+      });
+    }
+
+    merged.sort((a, b) {
+      final catA = (a['category'] ?? '').toString();
+      final catB = (b['category'] ?? '').toString();
+      final byCat = catA.compareTo(catB);
+      if (byCat != 0) return byCat;
+      return (a['code'] ?? '')
+          .toString()
+          .compareTo((b['code'] ?? '').toString());
+    });
+
+    final combined = <Map<String, dynamic>>[
+      ...packageEntries,
+      ...merged,
+    ];
 
     await _clinics
         .doc(labClinicId)
         .collection('catalog')
         .doc('main')
         .set({
-      'tests': tests,
-      'count': tests.length,
+      'tests': combined,
+      'count': combined.length,
+      'testCount': merged.length,
+      'packageCount': packageEntries.length,
       'updatedAt': FieldValue.serverTimestamp(),
     });
   }
@@ -260,6 +824,157 @@ class LabService {
   // =================================================================
   // LAB ORDERS
   // =================================================================
+
+  Future<double?> _resolvePricing({
+    required String labClinicId,
+    required List<LabTestItem> tests,
+  }) async {
+    if (tests.isEmpty) return 0;
+
+    final snap = await _clinics
+        .doc(labClinicId)
+        .collection('catalog')
+        .doc('main')
+        .get();
+    final raw = (snap.data()?['tests'] as List?) ?? const [];
+
+    final byCode = <String, double>{};
+    final byName = <String, double>{};
+    for (final e in raw) {
+      if (e is! Map) continue;
+      final price = (e['offerPrice'] as num?)?.toDouble() ??
+          (e['mrp'] as num?)?.toDouble();
+      if (price == null || price <= 0) continue;
+      final code = (e['code'] ?? '').toString().trim().toLowerCase();
+      final name = (e['name'] ?? '').toString().trim().toLowerCase();
+      if (code.isNotEmpty) byCode[code] = price;
+      if (name.isNotEmpty) byName[name] = price;
+    }
+
+    var total = 0.0;
+    for (final t in tests) {
+      final c = (t.code ?? '').trim().toLowerCase();
+      final n = t.name.trim().toLowerCase();
+      final p = byCode[c] ?? byName[n];
+      if (p == null) return null;
+      total += p;
+    }
+    return total;
+  }
+
+  /// Builds sample groups from the order's tests, grouping by sample type
+  /// using the lab's catalog. Assigns one sampleId per tube.
+  /// Idempotent: if the order already has sampleGroups, returns them.
+  Future<List<SampleGroup>> assignSampleIds({
+    required String orderId,
+    required String labClinicId,
+  }) async {
+    final orderRef = _orders.doc(orderId);
+    final orderSnap = await orderRef.get();
+    if (!orderSnap.exists) {
+      throw StateError('Lab order $orderId not found.');
+    }
+    final data = orderSnap.data() ?? {};
+
+    final existingRaw = (data['sampleGroups'] as List?) ?? const [];
+    if (existingRaw.isNotEmpty) {
+      return existingRaw
+          .map((e) =>
+              SampleGroup.fromMap(Map<String, dynamic>.from(e as Map)))
+          .toList();
+    }
+
+    final catSnap = await _clinics
+        .doc(labClinicId)
+        .collection('catalog')
+        .doc('main')
+        .get();
+    final catTests = ((catSnap.data()?['tests'] as List?) ?? const []);
+    final sampleTypeByCode = <String, String>{};
+    final sampleTypeByName = <String, String>{};
+    for (final e in catTests) {
+      if (e is! Map) continue;
+      final code = (e['code'] ?? '').toString().toLowerCase().trim();
+      final name = (e['name'] ?? '').toString().toLowerCase().trim();
+      final st = (e['sampleType'] ?? 'other').toString().toLowerCase();
+      if (code.isNotEmpty) sampleTypeByCode[code] = st;
+      if (name.isNotEmpty) sampleTypeByName[name] = st;
+    }
+
+    final rawTests = (data['tests'] as List?) ?? const [];
+    final byType = <String, List<String>>{};
+    for (final t in rawTests) {
+      final code = (t is Map ? t['code'] : null)?.toString();
+      final name = (t is Map ? t['name'] : t).toString();
+      final lookupCode = (code ?? '').toLowerCase().trim();
+      final lookupName = name.toLowerCase().trim();
+      final st = sampleTypeByCode[lookupCode] ??
+          sampleTypeByName[lookupName] ??
+          'other';
+      byType.putIfAbsent(st, () => []).add(code ?? name);
+    }
+
+    final year = DateTime.now().year;
+    final counterRef =
+        _db.collection('counters').doc('sample_${year}_$labClinicId');
+
+    final totalTubes = byType.length; // 1 tube per type by default
+    if (totalTubes == 0) return const [];
+
+    final startingNumbers =
+        await _db.runTransaction<List<int>>((tx) async {
+      final snap = await tx.get(counterRef);
+      final current = (snap.data()?['count'] as num?)?.toInt() ?? 0;
+      final next = current + totalTubes;
+      tx.set(
+        counterRef,
+        {'count': next, 'year': year, 'labClinicId': labClinicId},
+        SetOptions(merge: true),
+      );
+      return List.generate(totalTubes, (i) => current + 1 + i);
+    });
+
+    final suffixByType = <String, String>{
+      'blood': 'B',
+      'serum': 'B',
+      'plasma': 'B',
+      'urine': 'U',
+      'stool': 'S',
+      'sputum': 'P',
+      'swab': 'W',
+      'csf': 'C',
+      'tissue': 'T',
+      'other': 'X',
+    };
+
+    var idIndex = 0;
+    final groups = <SampleGroup>[];
+    for (final entry in byType.entries) {
+      final st = entry.key;
+      final testList = entry.value;
+      final suffix = suffixByType[st] ?? 'X';
+      final baseNum = startingNumbers[idIndex++];
+      final baseStr = baseNum.toString().padLeft(4, '0');
+      final sampleId = 'S-$year-$baseStr-$suffix';
+
+      groups.add(SampleGroup(
+        sampleType: st,
+        barcodeSuffix: suffix,
+        testCodes: testList,
+        tubeCount: 1,
+        sampleIds: [sampleId],
+        printedAt: const [],
+      ));
+    }
+
+    await orderRef.update({
+      'sampleGroups': groups.map((g) => g.toMap()).toList(),
+      'sampleGroupsAssignedAt': FieldValue.serverTimestamp(),
+      'sampleGroupsAssignedByUid':
+          FirebaseAuth.instance.currentUser?.uid,
+    });
+    return groups;
+  }
 
   Future<String> createOrder({
     String? referringClinicId,
@@ -269,6 +984,10 @@ class LabService {
     required String patientId,
     required String patientName,
     String? patientPhone,
+    String? patientEmail,
+    String? patientGender,
+    DateTime? patientDob,
+    String? patientBloodGroup,
     String? doctorDocId,
     String? doctorName,
     required List<LabTestItem> tests,
@@ -277,8 +996,61 @@ class LabService {
     String? appointmentId,
     String? deptId,
     double? billableAmount,
+    double? catalogAmount,
+    double? extraDiscount,
+    String? referringClinicName,
+    String? referringClinicPatientDocId,
+    LabCustomerModel? existingCustomer,
   }) async {
     final ref = _orders.doc();
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+
+    final hasReferral =
+        referringClinicId != null && referringClinicId!.isNotEmpty;
+    final hasDoctor = doctorDocId != null && doctorDocId!.isNotEmpty;
+    final String referralType;
+    final String customerSource;
+    if (hasReferral && hasDoctor) {
+      referralType = 'doctor_referral';
+      customerSource = 'clinic_linked';
+    } else if (hasReferral) {
+      referralType = 'clinic_walkin';
+      customerSource = 'clinic_linked';
+    } else {
+      referralType = 'direct_walkin';
+      customerSource = 'direct';
+    }
+
+    String? customerDocId = existingCustomer?.docId;
+    if (customerDocId == null && hasReferral) {
+      final srcPatientDocId =
+          referringClinicPatientDocId ?? patientDocId;
+      customerDocId = LabCustomerModel.deterministicId(
+        sourceClinicId: referringClinicId!,
+        sourcePatientDocId: srcPatientDocId,
+      );
+      await _labCustomerService.upsertClinicLinked(
+        labClinicId: labClinicId,
+        sourceClinicId: referringClinicId,
+        sourceClinicName: referringClinicName ?? '',
+        sourcePatientDocId: srcPatientDocId,
+        sourcePatientId: patientId,
+        fullName: patientName,
+        phone: patientPhone ?? '',
+        gender: patientGender ?? 'male',
+        email: patientEmail,
+        dob: patientDob,
+        bloodGroup: patientBloodGroup,
+      );
+    }
+
+    final isWalkIn = !hasReferral && !hasDoctor;
+    final double? resolvedAmount = isWalkIn
+        ? ((billableAmount != null && billableAmount > 0)
+            ? billableAmount
+            : await _resolvePricing(labClinicId: labClinicId, tests: tests))
+        : await _resolvePricing(labClinicId: labClinicId, tests: tests);
+
     await ref.set({
       'referringClinicId': referringClinicId,
       'labClinicId': labClinicId,
@@ -297,13 +1069,23 @@ class LabService {
       'status': 'ordered',
       'orderedAt': FieldValue.serverTimestamp(),
       'updatedAt': FieldValue.serverTimestamp(),
-      'updatedByUid': FirebaseAuth.instance.currentUser?.uid,
-      'billableAmount': billableAmount,
+      'updatedByUid': uid,
+      'billableAmount': resolvedAmount,
+      'catalogAmount': catalogAmount,
+      'extraDiscount': extraDiscount ?? 0,
       'paymentStatus': LabPaymentStatus.unpaid.name,
-      // ── New orders are not released — a receptionist must
-      //    release the report after payment is settled.
       'released': false,
+      'labCustomerDocId': customerDocId,
+      'customerSource': customerSource,
+      'referralType': referralType,
     });
+
+    if (customerDocId != null) {
+      try {
+        await _labCustomerService.recordOrderPlaced(customerDocId);
+      } catch (_) {}
+    }
+
     return ref.id;
   }
 
@@ -356,6 +1138,20 @@ class LabService {
   }
 
   Future<void> updateStatus(String orderId, LabOrderStatus status) async {
+    if (status == LabOrderStatus.ready) {
+      throw StateError(
+        'Use attachReport() to mark ready — a report must be uploaded first.',
+      );
+    }
+    if (status == LabOrderStatus.delivered) {
+      final snap = await _orders.doc(orderId).get();
+      final released = snap.data()?['released'] == true;
+      if (!released) {
+        throw StateError(
+          'Cannot mark delivered: report has not been released yet.',
+        );
+      }
+    }
     final data = <String, dynamic>{
       'status': status.name,
       'updatedAt': FieldValue.serverTimestamp(),
@@ -367,6 +1163,23 @@ class LabService {
         break;
       case LabOrderStatus.sampleCollected:
         data['sampleCollectedAt'] = FieldValue.serverTimestamp();
+        final snap = await _orders.doc(orderId).get();
+        final existingGroups =
+            (snap.data()?['sampleGroups'] as List?) ?? const [];
+        if (existingGroups.isEmpty) {
+          final labClinicId =
+              (snap.data()?['labClinicId'] ?? '').toString();
+          if (labClinicId.isNotEmpty) {
+            try {
+              final groups = await assignSampleIds(
+                orderId: orderId,
+                labClinicId: labClinicId,
+              );
+              data['sampleGroups'] =
+                  groups.map((g) => g.toMap()).toList();
+            } catch (_) {}
+          }
+        }
         break;
       case LabOrderStatus.processing:
         data['processingStartedAt'] = FieldValue.serverTimestamp();
@@ -381,6 +1194,22 @@ class LabService {
         break;
     }
     await _orders.doc(orderId).update(data);
+  }
+
+  Future<void> forwardToTechnician({
+    required String orderId,
+    required String forwardedByUid,
+    String? technicianUid,
+  }) async {
+    await _orders.doc(orderId).update({
+      'status': LabOrderStatus.accepted.name,
+      'acceptedAt': FieldValue.serverTimestamp(),
+      'forwardedAt': FieldValue.serverTimestamp(),
+      'forwardedByUid': forwardedByUid,
+      if (technicianUid != null) 'assignedTechnicianUid': technicianUid,
+      'updatedAt': FieldValue.serverTimestamp(),
+      'updatedByUid': forwardedByUid,
+    });
   }
 
   Future<void> cancelOrder(
@@ -408,16 +1237,6 @@ class LabService {
     });
   }
 
-  /// Upload a report.
-  ///
-  /// Sets `status = 'ready'` and explicitly `released = false`. The
-  /// report is uploaded and the technician's work is done, but the
-  /// report is **NOT yet visible** to the patient or referring
-  /// doctor. It becomes visible only after a receptionist calls
-  /// [releaseReport] once payment is settled.
-  ///
-  /// This is the enforcement point for the report-release gate. Do
-  /// not let the technician's upload directly flip visibility.
   Future<void> attachReport({
     required String orderId,
     required String reportUrl,
@@ -432,32 +1251,15 @@ class LabService {
       'reportUploadedByUid': FirebaseAuth.instance.currentUser?.uid,
       'status': 'ready',
       'reportReadyAt': FieldValue.serverTimestamp(),
-      // ── Release gate ──
-      // The report is uploaded but hidden. A receptionist must
-      // explicitly release it after payment is settled or waived.
       'released': false,
       'updatedAt': FieldValue.serverTimestamp(),
       'updatedByUid': FirebaseAuth.instance.currentUser?.uid,
     });
   }
 
-  /// Release a report.
-  ///
-  /// Called by the **receptionist** after payment is settled (paid
-  /// or waived). Until this runs, the report is invisible to the
-  /// patient and the referring doctor.
-  ///
-  /// Guards:
-  /// - Order must exist.
-  /// - Order must be in `status == ready`.
-  /// - A report must have been uploaded (`reportUrl` not null).
-  /// - Payment must be settled (`paymentStatus != unpaid`) or the
-  ///   caller must pass `overrideUnpaid: true` for edge cases
-  ///   (e.g. senior management releasing a report on credit).
   Future<void> releaseReport({
     required String orderId,
     required String releasedByUid,
-    bool overrideUnpaid = false,
   }) async {
     final ref = _orders.doc(orderId);
     final snap = await ref.get();
@@ -468,21 +1270,22 @@ class LabService {
     final status = (m['status'] ?? '').toString();
     final reportUrl = (m['reportUrl'] ?? '').toString();
     final paymentStatus = (m['paymentStatus'] ?? 'unpaid').toString();
+    final amount = (m['billableAmount'] as num?)?.toDouble() ?? 0;
     final alreadyReleased = m['released'] == true;
 
-    if (alreadyReleased) {
-      // Idempotent — safe to call twice.
-      return;
-    }
+    if (alreadyReleased) return;
     if (status != 'ready') {
       throw StateError(
           'Cannot release: order is in status "$status", not "ready".');
     }
     if (reportUrl.isEmpty) {
-      throw StateError(
-          'Cannot release: no report has been uploaded yet.');
+      throw StateError('Cannot release: no report uploaded yet.');
     }
-    if (paymentStatus == 'unpaid' && !overrideUnpaid) {
+    if (amount <= 0) {
+      throw StateError(
+          'Cannot release: billable amount not set. Set the fee first.');
+    }
+    if (paymentStatus == 'unpaid') {
       throw StateError(
           'Cannot release: payment not settled. Mark paid or waived first.');
     }
@@ -496,11 +1299,6 @@ class LabService {
     });
   }
 
-  // =================================================================
-  // MODEL A — PATIENT-FACING BILLING
-  // =================================================================
-
-  /// Receptionist sets (or corrects) the amount the patient must pay.
   Future<void> setBillableAmount({
     required String orderId,
     required double amount,
@@ -514,7 +1312,6 @@ class LabService {
     });
   }
 
-  /// Patient has paid.
   Future<void> markLabFeesPaid({
     required String orderId,
     required String collectedByUid,
@@ -528,7 +1325,6 @@ class LabService {
     });
   }
 
-  /// Fees waived.
   Future<void> waiveLabFees({
     required String orderId,
     required String collectedByUid,
