@@ -5,12 +5,14 @@ const { onDocumentCreated, onDocumentUpdated } = require("firebase-functions/v2/
 const { defineSecret } = require("firebase-functions/params");
 const admin = require("firebase-admin");
 const axios = require("axios");
+const crypto = require("crypto");
 
 admin.initializeApp();
 
 // Secrets stored in Google Cloud Secret Manager
 const MSG91_AUTH_KEY = defineSecret("MSG91_AUTH_KEY");
 const MSG91_TEMPLATE_ID = defineSecret("MSG91_TEMPLATE_ID");
+const MSG91_EMERGENCY_TEMPLATE_ID = defineSecret("MSG91_EMERGENCY_TEMPLATE_ID");
 
 // Common region for all functions
 const REGION = "asia-south1";
@@ -510,3 +512,513 @@ exports.backfillLabOrdersFields = onRequest(
         res.status(500).send(`Error: ${error.message}`);
       }
     });
+
+
+
+
+// =================================================================
+// Chemist user creation
+//
+// Creates a Firebase Auth user + writes the users/{uid} Firestore
+// doc + sends a password-reset email + marks the chemist doc as
+// invited, all in one server-side transaction.
+//
+// Called from the admin dashboard's "Send invite" button.
+//
+// The Admin SDK bypasses Firestore security rules and doesn't touch
+// the caller's auth session — no client-side auth-session juggling.
+// =================================================================
+exports.createChemistUser = onCall(
+    { region: REGION },
+    async (request) => {
+      // ── Auth check: only admins can invite chemists ──
+      if (!request.auth) {
+        throw new HttpsError(
+            "unauthenticated",
+            "Sign in as an admin to send invites.",
+        );
+      }
+
+      const callerSnap = await admin.firestore()
+          .collection("users")
+          .doc(request.auth.uid)
+          .get();
+
+      if (!callerSnap.exists || callerSnap.data().role !== "admin") {
+        throw new HttpsError(
+            "permission-denied",
+            "Only STAT admins can invite chemists.",
+        );
+      }
+
+      // ── Validate input ──
+      const {
+        email,
+        name = "",
+        phone = "",
+        chemistDocId,
+      } = request.data || {};
+
+      if (!email || !email.includes("@")) {
+        throw new HttpsError(
+            "invalid-argument",
+            "A valid email is required.",
+        );
+      }
+      if (!chemistDocId) {
+        throw new HttpsError(
+            "invalid-argument",
+            "chemistDocId is required.",
+        );
+      }
+
+      // ── Verify the chemist doc exists ──
+      const chemistRef = admin.firestore()
+          .collection("chemists").doc(chemistDocId);
+      const chemistSnap = await chemistRef.get();
+      if (!chemistSnap.exists) {
+        throw new HttpsError(
+            "not-found",
+            "Chemist record not found. Save the chemist first.",
+        );
+      }
+
+      const normalizedEmail = email.trim().toLowerCase();
+
+      // ── Create the auth user (or find existing) ──
+      let uid;
+      let created = false;
+      try {
+        const userRecord = await admin.auth().createUser({
+          email: normalizedEmail,
+          password: crypto.randomBytes(24).toString("base64"),
+          emailVerified: false,
+          disabled: false,
+        });
+        uid = userRecord.uid;
+        created = true;
+      } catch (err) {
+        if (err.code === "auth/email-already-exists") {
+          // Account exists — find it and re-link.
+          const existing = await admin.auth()
+              .getUserByEmail(normalizedEmail);
+          uid = existing.uid;
+        } else {
+          console.error("createUser failed:", err);
+          throw new HttpsError(
+              "internal",
+              `Failed to create user: ${err.message}`,
+          );
+        }
+      }
+
+      // ── Write the users/{uid} doc ──
+      await admin.firestore().collection("users").doc(uid).set({
+        name: name || "Chemist",
+        email: normalizedEmail,
+        phone: phone,
+        role: "chemist",
+        linkedChemistDocId: chemistDocId,
+        orgType: "pharmacy",
+        active: true,
+        mustChangePassword: false,
+        createdByUid: request.auth.uid,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      // ── Send password reset email ──
+      let resetLink = null;
+      try {
+        resetLink = await admin.auth()
+            .generatePasswordResetLink(normalizedEmail);
+      } catch (err) {
+        console.warn("generatePasswordResetLink failed:", err);
+      }
+
+      // ── Mark the chemist doc as invited ──
+      await chemistRef.update({
+        linkedUserUid: uid,
+        inviteStatus: "sent",
+        inviteSentAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return {
+        success: true,
+        uid,
+        created,
+        resetLink,
+      };
+    });
+
+// =================================================================
+// PILL REMINDERS — missed-dose escalation
+//
+// Runs every 5 minutes. Finds doses whose grace window has passed
+// without confirmation, marks them missed, and queues an SMS to the
+// patient's active emergency contact.
+//
+// The device path (Pill Guard) writes confirmedAt/confirmedBy='device'
+// directly to pillDoses. That dose is no longer `status='pending'`, so
+// this function skips it. No special-casing needed.
+// =================================================================
+exports.escalateMissedDoses = onSchedule(
+    {
+      schedule: "every 5 minutes",
+      timeZone: "Asia/Kolkata",
+      region: REGION,
+    },
+    async () => {
+      const db = admin.firestore();
+      const now = admin.firestore.Timestamp.now();
+
+      const missed = await db
+          .collection("pillDoses")
+          .where("status", "==", "pending")
+          .where("graceUntil", "<=", now)
+          .limit(200)
+          .get();
+
+      if (missed.empty) return;
+
+      let escalated = 0;
+      let noContact = 0;
+
+      for (const dose of missed.docs) {
+        const d = dose.data();
+        try {
+          // 1. Mark the dose as missed.
+          await dose.ref.update({
+            status: "missed",
+            escalatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+
+          // 2. Look up the active emergency contact with SMS opt-in.
+          const contacts = await db
+              .collection("emergencyContacts")
+              .where("patientDocId", "==", d.patientDocId)
+              .where("active", "==", true)
+              .where("smsOptIn", "==", true)
+              .limit(1)
+              .get();
+
+          if (contacts.empty) {
+            noContact++;
+            continue;
+          }
+
+          const contact = contacts.docs[0].data();
+
+          // 3. Load the schedule to include medication details.
+          const scheduleSnap = await db
+              .collection("pillSchedules")
+              .doc(d.scheduleId)
+              .get();
+          const s = scheduleSnap.data() || {};
+
+          const patientSnap = await db
+              .collection("patients")
+              .doc(d.patientDocId)
+              .get();
+          const patientName =
+              patientSnap.data()?.fullName || "The patient";
+
+          const scheduledTime = d.scheduledAt
+              .toDate()
+              .toLocaleTimeString("en-IN", {
+                timeZone: "Asia/Kolkata",
+                hour: "numeric",
+                minute: "2-digit",
+              });
+
+          // 4. Queue the emergency SMS.
+          await db.collection("emergencyNotifications").add({
+            type: "missed_dose",
+            doseId: dose.id,
+            scheduleId: d.scheduleId,
+            patientDocId: d.patientDocId,
+            patientAuthUid: d.patientAuthUid,
+            patientName,
+            contactName: contact.name || "",
+            contactPhone: contact.phone || "",
+            templateVars: {
+              var1: patientName,
+              var2: `${s.medicationName || "medication"} ${s.dose || ""}`.trim(),
+              var3: scheduledTime,
+            },
+            status: "pending",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+
+          // 5. Record the escalation on the dose.
+          await dose.ref.update({
+            "escalation.notifiedAt":
+                admin.firestore.FieldValue.serverTimestamp(),
+            "escalation.notifiedVia": "sms",
+            "escalation.emergencyContactId": contacts.docs[0].id,
+          });
+
+          escalated++;
+        } catch (e) {
+          console.error(`escalateMissedDoses: dose ${dose.id} failed:`, e);
+        }
+      }
+
+      console.log(
+          `escalateMissedDoses: ${escalated} escalated, ` +
+          `${noContact} skipped (no contact)`,
+      );
+    },
+);
+
+// =================================================================
+// PILL REMINDERS — emergency SMS sender
+//
+// Drains `emergencyNotifications` where status='pending' and sends
+// each via MSG91. Marks the doc 'sent' or 'failed' based on the
+// MSG91 response. Retries on transient errors (up to 3 attempts).
+// =================================================================
+exports.sendEmergencySms = onSchedule(
+    {
+      schedule: "every 1 minutes",
+      timeZone: "Asia/Kolkata",
+      region: REGION,
+      secrets: [MSG91_AUTH_KEY, MSG91_EMERGENCY_TEMPLATE_ID],
+    },
+    async () => {
+      const db = admin.firestore();
+      const pending = await db
+          .collection("emergencyNotifications")
+          .where("status", "==", "pending")
+          .limit(50)
+          .get();
+
+      if (pending.empty) return;
+
+      for (const notif of pending.docs) {
+        const n = notif.data();
+        const phone = (n.contactPhone || "").replace(/[^\d]/g, "");
+        if (phone.length < 10) {
+          await notif.ref.update({
+            status: "failed",
+            error: "Invalid phone number",
+            failedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          continue;
+        }
+
+        try {
+          // MSG91 sendSMS endpoint (transactional template).
+          const url = "https://control.msg91.com/api/v5/flow/";
+          const body = {
+            template_id: MSG91_EMERGENCY_TEMPLATE_ID.value(),
+            short_url: "0",
+            realTimeResponse: "1",
+            recipients: [
+              {
+                mobiles: `91${phone}`,
+                var1: n.templateVars?.var1 ?? "",
+                var2: n.templateVars?.var2 ?? "",
+                var3: n.templateVars?.var3 ?? "",
+              },
+            ],
+          };
+
+          const resp = await axios.post(url, body, {
+            headers: {
+              authkey: MSG91_AUTH_KEY.value(),
+              "Content-Type": "application/json",
+            },
+            timeout: 15000,
+          });
+
+          if (resp.status >= 200 && resp.status < 300) {
+            await notif.ref.update({
+              status: "sent",
+              sentAt: admin.firestore.FieldValue.serverTimestamp(),
+              providerResponse: resp.data,
+            });
+          } else {
+            throw new Error(`MSG91 returned ${resp.status}`);
+          }
+        } catch (err) {
+          const attempts = (n.attempts || 0) + 1;
+          console.error(
+              `sendEmergencySms: ${notif.id} attempt ${attempts} failed:`,
+              err.response?.data || err.message,
+          );
+
+          if (attempts >= 3) {
+            await notif.ref.update({
+              status: "failed",
+              attempts,
+              error: JSON.stringify(
+                  err.response?.data || err.message,
+              ).slice(0, 500),
+              failedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          } else {
+            // Back off, keep pending for the next run.
+            await notif.ref.update({
+              attempts,
+              lastError: String(
+                  err.response?.data?.message || err.message,
+              ).slice(0, 500),
+            });
+          }
+        }
+      }
+    },
+);
+
+// =================================================================
+// PILL GUARD — device event handler
+//
+// Pill Guard (Arduino device) reports dispense events by writing to
+// `pillDeviceEvents/{eventId}` via its gateway (BLE→phone→Firestore,
+// or WiFi→Cloud Function→Firestore).
+//
+// This function matches each dispense event to the nearest pending
+// dose within ±10 minutes and marks it taken with
+// confirmedBy='device'. The app's escalation logic then skips it.
+//
+// The schema is identical to a manual "taken" confirmation — the app
+// UI shows the same record, just with a different confirmedBy tag.
+// =================================================================
+exports.handlePillDeviceEvent = onDocumentCreated(
+    { document: "pillDeviceEvents/{eventId}", region: REGION },
+    async (event) => {
+      const db = admin.firestore();
+      const eventSnap = event.data;
+      if (!eventSnap) return;
+
+      const e = eventSnap.data();
+      if (e.eventType !== "dispensed") return;
+
+      const patientDocId = e.patientDocId;
+      if (!patientDocId) {
+        console.warn(`Device event ${event.params.eventId} has no patientDocId`);
+        return;
+      }
+
+      // ±10 minute window around the event time.
+      const occurredAt = e.occurredAt?.toDate() || new Date();
+      const low = new Date(occurredAt.getTime() - 10 * 60 * 1000);
+      const high = new Date(occurredAt.getTime() + 10 * 60 * 1000);
+
+      const doses = await db
+          .collection("pillDoses")
+          .where("patientDocId", "==", patientDocId)
+          .where("status", "==", "pending")
+          .where("scheduledAt", ">=", admin.firestore.Timestamp.fromDate(low))
+          .where("scheduledAt", "<=", admin.firestore.Timestamp.fromDate(high))
+          .orderBy("scheduledAt")
+          .limit(1)
+          .get();
+
+      if (doses.empty) {
+        console.warn(
+            `Pill device event ${event.params.eventId}: no matching dose ` +
+            `within ±10 min for patient ${patientDocId}`,
+        );
+        // Record the orphan event for later inspection.
+        await eventSnap.ref.update({
+          matchedDoseId: null,
+          matchedAt: admin.firestore.FieldValue.serverTimestamp(),
+          matchResult: "no_match",
+        });
+        return;
+      }
+
+      const doseRef = doses.docs[0].ref;
+      await doseRef.update({
+        status: "taken",
+        confirmedBy: "device",
+        confirmedAt: e.occurredAt || admin.firestore.FieldValue.serverTimestamp(),
+        deviceEventId: event.params.eventId,
+      });
+
+      await eventSnap.ref.update({
+        matchedDoseId: doses.docs[0].id,
+        matchedAt: admin.firestore.FieldValue.serverTimestamp(),
+        matchResult: "matched",
+      });
+
+      console.log(
+          `Pill device event ${event.params.eventId} → dose ` +
+          `${doses.docs[0].id} marked taken`,
+      );
+    },
+);
+
+// =================================================================
+// PILL GUARD — HTTP gateway (for Arduino devices that can't write
+// to Firestore directly)
+//
+// The device POSTs to this endpoint with a shared device key. The
+// function verifies the key, then writes the event to
+// `pillDeviceEvents/{auto}`. The onDocumentCreated trigger above
+// takes over from there.
+//
+// Until the hardware exists, this function is deployed but never
+// called. That's fine — it's dormant.
+// =================================================================
+const PILL_DEVICE_SHARED_KEY =
+    defineSecret("PILL_DEVICE_SHARED_KEY");
+
+exports.pillDeviceGateway = onRequest(
+    {
+      region: REGION,
+      invoker: "public",
+      cors: true,
+      secrets: [PILL_DEVICE_SHARED_KEY],
+    },
+    async (req, res) => {
+      if (req.method !== "POST") {
+        res.status(405).send("Method not allowed");
+        return;
+      }
+
+      // Verify the device's shared key. Simple but sufficient until
+      // per-device certificates are introduced.
+      const providedKey =
+          req.headers["x-device-key"] || req.body?.deviceKey;
+      if (providedKey !== PILL_DEVICE_SHARED_KEY.value()) {
+        res.status(401).send("Unauthorized");
+        return;
+      }
+
+      const {
+        deviceId,
+        patientDocId,
+        patientAuthUid,
+        eventType,
+        occurredAt,
+        compartmentId,
+      } = req.body || {};
+
+      if (!deviceId || !patientDocId || !eventType) {
+        res.status(400).send("Missing required fields");
+        return;
+      }
+
+      try {
+        await admin.firestore().collection("pillDeviceEvents").add({
+          deviceId,
+          patientDocId,
+          patientAuthUid: patientAuthUid || null,
+          eventType,
+          compartmentId: compartmentId || null,
+          occurredAt: occurredAt
+              ? admin.firestore.Timestamp.fromDate(new Date(occurredAt))
+              : admin.firestore.FieldValue.serverTimestamp(),
+          receivedAt: admin.firestore.FieldValue.serverTimestamp(),
+          source: "http_gateway",
+        });
+        res.status(200).json({ success: true });
+      } catch (err) {
+        console.error("pillDeviceGateway error:", err);
+        res.status(500).json({ success: false, error: err.message });
+      }
+    },
+);

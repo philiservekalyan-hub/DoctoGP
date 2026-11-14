@@ -9,13 +9,21 @@ import '../../../core/services/canonical_test_service.dart';
 
 /// Multi-select picker for adding canonical tests to a lab's catalogue.
 ///
-/// Returns the list of selected `testId`s when the user taps "Add".
-/// Search and category chips narrow the list; selections persist across
-/// chip changes so a lab can pick CBC from Haematology and LFT from
-/// Biochemistry in one flow.
+/// Tests already present in the lab (`existingTestIds`) are rendered as
+/// "ADDED", disabled, and excluded from selection so the user cannot
+/// accidentally re-add them. A "Hide added" chip lets the user focus on
+/// the tests they can still add.
 class CanonicalTestPickerSheet extends ConsumerStatefulWidget {
   final String labClinicId;
-  const CanonicalTestPickerSheet({super.key, required this.labClinicId});
+
+  /// Canonical test IDs already in this lab's catalogue.
+  final Set<String> existingTestIds;
+
+  const CanonicalTestPickerSheet({
+    super.key,
+    required this.labClinicId,
+    this.existingTestIds = const {},
+  });
 
   @override
   ConsumerState<CanonicalTestPickerSheet> createState() =>
@@ -28,6 +36,7 @@ class _CanonicalTestPickerSheetState
   final Set<String> _selected = {};
   String _query = '';
   LabTestCategory? _categoryFilter;
+  bool _hideAdded = false;
 
   @override
   void dispose() {
@@ -70,7 +79,8 @@ class _CanonicalTestPickerSheetState
                 Text('Add tests', style: AppTextStyles.h3),
                 const Spacer(),
                 Text(
-                  '${_selected.length} selected',
+                  '${_selected.length} selected · '
+                  '${widget.existingTestIds.length} added',
                   style: AppTextStyles.caption,
                 ),
               ]),
@@ -100,7 +110,7 @@ class _CanonicalTestPickerSheetState
             ),
             const SizedBox(height: 8),
 
-            // ── Category chips ──
+            // ── Category chips + Hide added ──
             _categoryChips(),
             const SizedBox(height: 8),
             const Divider(height: 1),
@@ -137,7 +147,10 @@ class _CanonicalTestPickerSheetState
                             Text(
                               all.isEmpty
                                   ? 'No tests in the master dictionary yet.\nAsk your admin to add some.'
-                                  : 'No tests match your search.',
+                                  : _hideAdded && _query.isEmpty &&
+                                          _categoryFilter == null
+                                      ? 'All tests in this category are already added.'
+                                      : 'No tests match your search.',
                               style: AppTextStyles.bodyMuted,
                               textAlign: TextAlign.center,
                             ),
@@ -176,6 +189,11 @@ class _CanonicalTestPickerSheetState
               t.codeLower.contains(q) || t.nameLower.contains(q))
           .toList();
     }
+    if (_hideAdded) {
+      list = list
+          .where((t) => !widget.existingTestIds.contains(t.testId))
+          .toList();
+    }
     return list;
   }
 
@@ -197,11 +215,19 @@ class _CanonicalTestPickerSheetState
             onTap: () => setState(() => _categoryFilter = c),
           ),
         ],
+        const SizedBox(width: 12),
+        // Hide-added toggle lives at the end so it doesn't disrupt
+        // the category row's rhythm.
+        _chip(
+          label: _hideAdded ? 'Hide added: on' : 'Hide added',
+          selected: _hideAdded,
+          onTap: () => setState(() => _hideAdded = !_hideAdded),
+        ),
       ]),
     );
   }
 
-   Widget _chip({
+  Widget _chip({
     required String label,
     required bool selected,
     required VoidCallback onTap,
@@ -230,23 +256,55 @@ class _CanonicalTestPickerSheetState
   }
 
   Widget _row(CanonicalTestModel t) {
+    final alreadyAdded = widget.existingTestIds.contains(t.testId);
     final isSel = _selected.contains(t.testId);
+
     return CheckboxListTile(
-      value: isSel,
-      onChanged: (v) {
-        setState(() {
-          if (v == true) {
-            _selected.add(t.testId);
-          } else {
-            _selected.remove(t.testId);
-          }
-        });
-      },
-      title: Text(
-        t.code.isEmpty ? t.name : '${t.code} — ${t.name}',
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: AppTextStyles.body,
+      value: alreadyAdded || isSel,
+      // Already-added tests are disabled — they cannot be selected again.
+      onChanged: alreadyAdded
+          ? null
+          : (v) {
+              setState(() {
+                if (v == true) {
+                  _selected.add(t.testId);
+                } else {
+                  _selected.remove(t.testId);
+                }
+              });
+            },
+      title: Row(
+        children: [
+          Expanded(
+            child: Text(
+              t.code.isEmpty ? t.name : '${t.code} — ${t.name}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: AppTextStyles.body.copyWith(
+                color: alreadyAdded ? AppColors.textMuted : null,
+              ),
+            ),
+          ),
+          if (alreadyAdded)
+            Container(
+              margin: const EdgeInsets.only(left: 8),
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: AppColors.success.withOpacity(.15),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: const Text(
+                'ADDED',
+                style: TextStyle(
+                  color: AppColors.success,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.4,
+                ),
+              ),
+            ),
+        ],
       ),
       subtitle: Text(
         '${t.category.label} • ${t.sampleType.label}'

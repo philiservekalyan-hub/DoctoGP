@@ -9,6 +9,7 @@ import '../../../app/router.dart';
 import '../../../app/theme/app_colors.dart';
 import '../../../app/theme/app_text_styles.dart';
 import '../../../core/models/user_model.dart';
+import '../../../core/providers/app_info_provider.dart';
 import '../../../core/widgets/custom_button.dart';
 import '../../../core/widgets/custom_text_field.dart';
 
@@ -55,10 +56,6 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
       }
 
       // ── Deactivated account check ──
-      // The user doc carries `active`. When the lab owner (or any
-      // clinic admin) deactivates a member from the Team screen, that
-      // field flips to false. We refuse the sign-in here rather than
-      // let them reach a dashboard that will fail every write.
       if (user.active == false) {
         try {
           await FirebaseAuth.instance.signOut();
@@ -88,29 +85,27 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
     }
   }
 
-  /// Same decision logic as `SplashScreen._landingFor` — must stay
-  /// in sync.
   Future<String> _landingFor(UserModel user) async {
     switch (user.role) {
       case UserRole.patient:
         return '/patient';
-          case UserRole.owner:
-      if (user.orgType == 'lab') return '/lab';
-      if (user.orgType == 'clinic') return '/owner';
-      if (user.clinicId == null || user.clinicId!.isEmpty) {
+      case UserRole.owner:
+        if (user.orgType == 'lab') return '/lab';
+        if (user.orgType == 'clinic') return '/owner';
+        if (user.clinicId == null || user.clinicId!.isEmpty) {
+          return '/owner';
+        }
+        try {
+          final org = await FirebaseFirestore.instance
+              .collection('clinics')
+              .doc(user.clinicId)
+              .get();
+          final type = org.data()?['type'];
+          if (type == 'lab') return '/lab';
+        } catch (e) {
+          debugPrint('[Login] orgType lookup failed: $e');
+        }
         return '/owner';
-      }
-      try {
-        final org = await FirebaseFirestore.instance
-            .collection('clinics')
-            .doc(user.clinicId)
-            .get();
-        final type = org.data()?['type'];
-        if (type == 'lab') return '/lab';
-      } catch (e) {
-        debugPrint('[Login] orgType lookup failed: $e');
-      }
-      return '/owner';
       case UserRole.doctor:
         return '/doctor';
       case UserRole.nurse:
@@ -122,7 +117,6 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
       case UserRole.receptionist:
         if (user.orgType == 'lab') return '/lab-reception';
         if (user.orgType == 'clinic') return '/reception';
-
         if (user.clinicId == null || user.clinicId!.isEmpty) {
           return '/reception';
         }
@@ -137,7 +131,8 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
           debugPrint('[Login] orgType lookup failed: $e');
         }
         return '/reception';
-
+      case UserRole.chemist:
+        return '/chemist';
       default:
         throw StateError('Unknown role: ${user.role}');
     }
@@ -155,24 +150,24 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const SizedBox(height: 30),
-Center(
-  child: Image.asset(
-    'assets/images/logo.png',
-    height: 120,
-    fit: BoxFit.contain,
-    errorBuilder: (_, __, ___) => Container(
-      width: 200,
-      height: 120,
-      decoration: BoxDecoration(
-        gradient: AppColors.primaryGradient,
-        borderRadius: BorderRadius.circular(18),
-      ),
-      child: const Icon(Icons.medical_services_rounded,
-          color: AppColors.background, size: 30),
-    ),
-  ),
-),
-const SizedBox(height: 28),
+                Center(
+                  child: Image.asset(
+                    'assets/images/logo.png',
+                    height: 120,
+                    fit: BoxFit.contain,
+                    errorBuilder: (_, __, ___) => Container(
+                      width: 200,
+                      height: 120,
+                      decoration: BoxDecoration(
+                        gradient: AppColors.primaryGradient,
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                      child: const Icon(Icons.medical_services_rounded,
+                          color: AppColors.background, size: 30),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 28),
                 Text('Welcome back', style: AppTextStyles.h1),
                 const SizedBox(height: 8),
                 Text('Sign in to your clinic account',
@@ -264,6 +259,29 @@ const SizedBox(height: 28),
                     style: AppTextStyles.caption,
                   ),
                 ),
+
+                // ── App version ──
+                const SizedBox(height: 28),
+                Center(
+                  child: Consumer(
+                    builder: (context, ref, _) {
+                      final label =
+                          ref.watch(appVersionLabelProvider);
+                      return label.maybeWhen(
+                        data: (text) => Text(
+                          text,
+                          style: AppTextStyles.caption.copyWith(
+                            color: AppColors.textMuted,
+                            fontSize: 11,
+                            letterSpacing: 0.3,
+                          ),
+                        ),
+                        orElse: () => const SizedBox(height: 14),
+                      );
+                    },
+                  ),
+                ),
+                const SizedBox(height: 8),
               ],
             ),
           ),

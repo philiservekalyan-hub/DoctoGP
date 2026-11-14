@@ -9,6 +9,7 @@ import '../../../app/router.dart';
 import '../../../app/theme/app_colors.dart';
 import '../../../app/theme/app_text_styles.dart';
 import '../../../core/models/lab_order_model.dart';
+import '../../../core/models/user_model.dart'; 
 import '../../../core/providers/service_providers.dart';
 import '../../../core/widgets/empty_state.dart';
 import '../../../core/widgets/glass_card.dart';
@@ -277,7 +278,7 @@ class LabDashboard extends ConsumerWidget {
             }
 
             // ── Gates for the "back to owner dashboard" icon ──
-            final isOwner = user?.role == 'owner';
+            final isOwner = user?.role == UserRole.owner;
             final canPractise = user?.canPractise == true;
 
             final ordersAsync = ref.watch(_labOrdersProvider);
@@ -291,28 +292,49 @@ class LabDashboard extends ConsumerWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // ── Title row: name + badge on top ──
-                    Row(children: [
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment:
-                              CrossAxisAlignment.start,
-                          children: [
-                            Text('Lab operations',
-                                style: AppTextStyles.bodyMuted),
-                            const SizedBox(height: 4),
-                            Text(
-                              user?.name ?? 'Lab',
-                              style: AppTextStyles.h3,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ],
-                        ),
-                      ),
-                      const RoleBadge(
-                          label: 'Lab', color: AppColors.labAccent),
-                    ]),
+                    // ── Title row: STAT icon + name + badge on top ──
+Row(children: [
+  ClipRRect(
+    borderRadius: BorderRadius.circular(15),
+    child: Image.asset(
+      'assets/images/icon.png',
+      width: 46,
+      height: 46,
+      fit: BoxFit.cover,
+      errorBuilder: (_, __, ___) => Container(
+        width: 46,
+        height: 46,
+        decoration: BoxDecoration(
+          color: AppColors.labAccent.withOpacity(.14),
+          borderRadius: BorderRadius.circular(15),
+        ),
+        child: const Icon(Icons.science_rounded,
+            color: AppColors.labAccent, size: 27),
+      ),
+    ),
+  ),
+  const SizedBox(width: 12),
+  Expanded(
+    child: Column(
+      crossAxisAlignment:
+          CrossAxisAlignment.start,
+      children: [
+        Text('STAT',
+            style: AppTextStyles.h3),
+        const SizedBox(height: 4),
+        Text(
+          user?.name ?? 'Lab',
+          style: AppTextStyles.bodyMuted,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+      ],
+    ),
+  ),
+  const RoleBadge(
+      label: 'Lab', color: AppColors.labAccent),
+]),
+
                     const SizedBox(height: 8),
 
                     // ── Icon row: actions on their own line ──
@@ -342,13 +364,7 @@ class LabDashboard extends ConsumerWidget {
                         if (isOwner && canPractise)
                           IconButton(
                             tooltip: 'Back to owner dashboard',
-                            onPressed: () {
-                              if (context.canPop()) {
-                                context.pop();
-                              } else {
-                                context.go('/lab');
-                              }
-                            },
+                           onPressed: () => context.go('/lab-owner'),
                             icon: const Icon(
                               Icons.admin_panel_settings_rounded,
                               color: AppColors.labAccent,

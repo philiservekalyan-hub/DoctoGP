@@ -7,6 +7,7 @@ enum UserRole {
   nurse,
   lab,
   admin,
+  chemist,
   unknown,
 }
 
@@ -110,6 +111,8 @@ class UserModel {
         return UserRole.lab;
       case 'admin':
         return UserRole.admin;
+       case 'chemist':
+        return UserRole.chemist;
       default:
         return UserRole.unknown;
     }
@@ -156,6 +159,8 @@ class UserModel {
         return orgType == 'lab' ? 'Lab Owner' : 'Clinic Owner';
       case UserRole.nurse:
         return 'Nurse';
+      case UserRole.chemist:
+        return 'Chemist';
       default:
         return 'Unknown';
     }

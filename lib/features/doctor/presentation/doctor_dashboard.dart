@@ -102,7 +102,7 @@ class DoctorDashboard extends ConsumerWidget {
       if (isOwner)
         IconButton(
           tooltip: 'Owner dashboard',
-          onPressed: () => context.push('/doctor/owner'),
+          onPressed: () => context.go('/doctor/owner'),
           icon: const Icon(Icons.insights_rounded,
               color: AppColors.textSecondary),
         ),

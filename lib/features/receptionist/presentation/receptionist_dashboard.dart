@@ -1,5 +1,7 @@
+// lib/features/receptionist/presentation/receptionist_dashboard.dart
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 import 'package:intl/intl.dart';
 
 import '../../../../app/router.dart';
@@ -7,10 +9,11 @@ import '../../../../app/theme/app_colors.dart';
 import '../../../../app/theme/app_text_styles.dart';
 import '../../../../core/models/appointment_model.dart';
 import '../../../../core/models/appointment_request_model.dart';
+import '../../../../core/models/subscription_access.dart';
 import '../../../../core/providers/service_providers.dart';
+import '../../../../core/providers/subscription_providers.dart';
 import '../../../../core/services/dashboard_service.dart';
-    
-import '../../../../core/services/patient_service.dart';   // NEW
+import '../../../../core/services/patient_service.dart';
 import '../../../../core/services/reception_stats_service.dart';
 import '../../../../core/widgets/empty_state.dart';
 import '../../../../core/widgets/glass_card.dart';
@@ -18,10 +21,105 @@ import '../../../../core/widgets/section_header.dart';
 import '../../../../shared/widgets/clinic_app_bar.dart';
 import '../../shared/find_appointment_screen.dart';
 import '../../shared/reschedule_appointment_dialog.dart';
-import 'add_patient_screen.dart';                          // NEW
+import '../../subscription/widgets/subscription_banner.dart';
+import '../../subscription/widgets/subscription_gate.dart';
+import 'add_patient_screen.dart';
 import 'patient_lookup_screen.dart';
 import 'pending_requests_screen.dart';
 import 'unpaid_today_screen.dart';
+
+/// Opens AddPatientScreen only when the clinic subscription allows
+/// new-patient registration. Otherwise shows the upgrade dialog.
+///
+/// Returns `true` if a patient was added, `false` otherwise (declined,
+/// blocked, or no action taken).
+Future<bool> _openAddPatientIfAllowed({
+  required BuildContext context,
+  required WidgetRef ref,
+  required String clinicId,
+  LabCustomerMatch? prefill,
+}) async {
+  final access = ref.read(subscriptionAccessProvider(
+    (entityType: 'clinic', entityId: clinicId, planType: 'clinic_monthly'),
+  ));
+
+  if (!access.allows(SubscriptionFeature.newPatientRegistration)) {
+    await _showAddPatientUpgradeDialog(context, ref, clinicId);
+    return false;
+  }
+
+  final added = await Navigator.of(context).push<bool>(
+    MaterialPageRoute(
+      builder: (_) => prefill == null
+          ? const AddPatientScreen()
+          : AddPatientScreen(prefill: prefill),
+    ),
+  );
+  return added == true;
+}
+
+/// The one dialog used everywhere. Explains what's blocked and what
+/// isn't, then offers to open checkout.
+Future<void> _showAddPatientUpgradeDialog(
+  BuildContext context,
+  WidgetRef ref,
+  String clinicId,
+) async {
+  final renew = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: AppColors.surface,
+      title: Row(children: [
+        const Icon(Icons.lock_outline_rounded, color: AppColors.warning),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text('Subscription inactive', style: AppTextStyles.h3),
+        ),
+      ]),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Registering new patients requires an active subscription.',
+            style: AppTextStyles.body,
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'Your existing patients remain fully accessible — you can '
+            'check them in, view records, collect fees, and manage their '
+            'appointments.',
+            style: AppTextStyles.bodyMuted,
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'Renew to resume new registrations, staff invitations, '
+            'analytics, and bulk exports.',
+            style: AppTextStyles.caption.copyWith(color: AppColors.info),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx, false),
+          child: const Text('Not now'),
+        ),
+        ElevatedButton(
+          onPressed: () => Navigator.pop(ctx, true),
+          child: const Text('Renew now'),
+        ),
+      ],
+    ),
+  );
+
+  if (renew == true && context.mounted) {
+    context.push(
+      '/subscription/checkout'
+      '?entityType=clinic&entityId=$clinicId&planType=clinic_monthly',
+    );
+  }
+}
+
 
 class ReceptionistDashboard extends ConsumerStatefulWidget {
   const ReceptionistDashboard({super.key});
@@ -44,6 +142,37 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
   @override
   Widget build(BuildContext context) {
     final userAsync = ref.watch(currentUserProvider);
+
+    return Scaffold(
+      backgroundColor: AppColors.background,
+      body: SafeArea(
+        child: userAsync.when(
+          loading: () => const Center(
+              child: CircularProgressIndicator(color: AppColors.primary)),
+          error: (e, _) => Center(
+              child: Text('Error: $e',
+                  style: const TextStyle(color: AppColors.error))),
+          data: (user) {
+            if (user == null) {
+              return const Center(child: Text('Not signed in.'));
+            }
+            final clinicId = user.clinicId ?? '';
+            if (clinicId.isEmpty) {
+              return const Center(
+                  child: Text('No clinic linked to your account.'));
+            }
+            return _buildScaffold(context, user, clinicId);
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildScaffold(
+    BuildContext context,
+    dynamic user,
+    String clinicId,
+  ) {
     final todayAsync = ref.watch(todayAllAppointmentsProvider);
     final invoiceAsync = ref.watch(todayInvoiceStatsProvider);
     final routedAsync = ref.watch(routedToDoctorProvider);
@@ -52,14 +181,9 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
 
     return Scaffold(
       backgroundColor: AppColors.background,
-      // NEW: floating action button to add a new patient
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => _openAddPatient(context),
-        backgroundColor: AppColors.primary,
-        foregroundColor: Colors.white,
-        icon: const Icon(Icons.person_add_alt_1_rounded),
-        label: const Text('New Patient'),
-      ),
+      // FAB is gated: opens the subscription upgrade dialog in
+      // restricted state, otherwise opens AddPatientScreen.
+      floatingActionButton: _newPatientFab(context, clinicId),
       appBar: ClinicAppBar(
         title: 'Reception',
         extraActions: [
@@ -76,80 +200,82 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
         ],
       ),
       body: SafeArea(
-        child: userAsync.when(
-          loading: () => const Center(
-              child: CircularProgressIndicator(color: AppColors.primary)),
-          error: (e, _) => Center(
-              child: Text('Error: $e',
-                  style: const TextStyle(color: AppColors.error))),
-          data: (user) => RefreshIndicator(
-            color: AppColors.primary,
-            onRefresh: () async {
-              ref.invalidate(todayAllAppointmentsProvider);
-              ref.invalidate(todayInvoiceStatsProvider);
-              ref.invalidate(routedToDoctorProvider);
-              ref.invalidate(pendingRequestsProvider);
-              ref.invalidate(appointmentsForDayProvider(_queueDay));
-            },
-            child: SingleChildScrollView(
-              physics: const AlwaysScrollableScrollPhysics(),
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('Hello, ${user?.name.split(" ").first ?? "there"}',
-                      style: AppTextStyles.bodyMuted),
-                  const SizedBox(height: 4),
-                  Text(_greeting(), style: AppTextStyles.h1),
-                  const SizedBox(height: 20),
-                  _searchBar(context),
-                  const SizedBox(height: 24),
-                  _needsAttention(context, requestsAsync, todayAsync,
-                      invoiceAsync),
-                  const SizedBox(height: 24),
-                  const SectionHeader(title: 'Today at a glance'),
-                  _glanceGrid(todayAsync, invoiceAsync),
-                  const SizedBox(height: 24),
-                  const SectionHeader(title: 'Today by doctor'),
-                  _byDoctor(todayAsync),
-                  const SizedBox(height: 24),
-                  const SectionHeader(title: 'Today by slot'),
-                  _bySlot(todayAsync),
-                  const SizedBox(height: 24),
-                  Row(children: [
-                    const Expanded(child: SectionHeader(title: 'Queue')),
-                    IconButton(
-                      icon: const Icon(Icons.chevron_left_rounded),
-                      onPressed: () => setState(() => _queueDay = _queueDay
-                          .subtract(const Duration(days: 1))),
-                    ),
-                    TextButton(
-                      onPressed: () async {
-                        final d = await showDatePicker(
-                          context: context,
-                          initialDate: _queueDay,
-                          firstDate: DateTime.now()
-                              .subtract(const Duration(days: 365)),
-                          lastDate: DateTime.now()
-                              .add(const Duration(days: 365)),
-                        );
-                        if (d != null) setState(() => _queueDay = d);
-                      },
-                      child: Text(DateFormat('EEE, dd MMM').format(_queueDay)),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.chevron_right_rounded),
-                      onPressed: () => setState(() => _queueDay = _queueDay
-                          .add(const Duration(days: 1))),
-                    ),
-                  ]),
-                  _queueList(dayQueueAsync),
-                  const SizedBox(height: 24),
-                  const SectionHeader(title: 'Routed to Doctor'),
-                  _routedList(routedAsync),
-                  const SizedBox(height: 80),   // was 40 — extra space for the FAB
-                ],
-              ),
+        child: RefreshIndicator(
+          color: AppColors.primary,
+          onRefresh: () async {
+            ref.invalidate(todayAllAppointmentsProvider);
+            ref.invalidate(todayInvoiceStatsProvider);
+            ref.invalidate(routedToDoctorProvider);
+            ref.invalidate(pendingRequestsProvider);
+            ref.invalidate(appointmentsForDayProvider(_queueDay));
+          },
+          child: SingleChildScrollView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // ---- Subscription banner ----
+                SubscriptionBanner(
+                  entityType: 'clinic',
+                  entityId: clinicId,
+                  planType: 'clinic_monthly',
+                  onRenew: () => _openCheckout(context, clinicId),
+                ),
+
+                Text(
+                    'Hello, ${user?.name.split(" ").first ?? "there"}',
+                    style: AppTextStyles.bodyMuted),
+                const SizedBox(height: 4),
+                Text(_greeting(), style: AppTextStyles.h1),
+                const SizedBox(height: 20),
+                _searchBar(context),
+                const SizedBox(height: 24),
+                _needsAttention(context, requestsAsync, todayAsync,
+                    invoiceAsync),
+                const SizedBox(height: 24),
+                const SectionHeader(title: 'Today at a glance'),
+                _glanceGrid(todayAsync, invoiceAsync),
+                const SizedBox(height: 24),
+                const SectionHeader(title: 'Today by doctor'),
+                _byDoctor(todayAsync),
+                const SizedBox(height: 24),
+                const SectionHeader(title: 'Today by slot'),
+                _bySlot(todayAsync),
+                const SizedBox(height: 24),
+                Row(children: [
+                  const Expanded(child: SectionHeader(title: 'Queue')),
+                  IconButton(
+                    icon: const Icon(Icons.chevron_left_rounded),
+                    onPressed: () => setState(() => _queueDay = _queueDay
+                        .subtract(const Duration(days: 1))),
+                  ),
+                  TextButton(
+                    onPressed: () async {
+                      final d = await showDatePicker(
+                        context: context,
+                        initialDate: _queueDay,
+                        firstDate: DateTime.now()
+                            .subtract(const Duration(days: 365)),
+                        lastDate: DateTime.now()
+                            .add(const Duration(days: 365)),
+                      );
+                      if (d != null) setState(() => _queueDay = d);
+                    },
+                    child: Text(DateFormat('EEE, dd MMM').format(_queueDay)),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.chevron_right_rounded),
+                    onPressed: () => setState(() => _queueDay = _queueDay
+                        .add(const Duration(days: 1))),
+                  ),
+                ]),
+                _queueList(dayQueueAsync),
+                const SizedBox(height: 24),
+                const SectionHeader(title: 'Routed to Doctor'),
+                _routedList(routedAsync),
+                const SizedBox(height: 80),
+              ],
             ),
           ),
         ),
@@ -157,19 +283,115 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
     );
   }
 
-  // NEW: open AddPatientScreen and refresh dashboards if a patient was added
-  Future<void> _openAddPatient(BuildContext context) async {
-    final added = await Navigator.of(context).push<bool>(
-      MaterialPageRoute(builder: (_) => const AddPatientScreen()),
+  // -------------------------------------------------------------
+  // Subscription wiring
+  // -------------------------------------------------------------
+
+  void _openCheckout(BuildContext context, String clinicId) {
+    context.push(
+      '/subscription/checkout'
+      '?entityType=clinic&entityId=$clinicId&planType=clinic_monthly',
     );
-    if (added == true) {
-      ref.invalidate(todayAllAppointmentsProvider);
-      ref.invalidate(todayInvoiceStatsProvider);
-      ref.invalidate(routedToDoctorProvider);
-      ref.invalidate(pendingRequestsProvider);
-      ref.invalidate(appointmentsForDayProvider(_queueDay));
+  }
+
+  Widget _newPatientFab(BuildContext context, String clinicId) {
+  final access = ref.watch(subscriptionAccessProvider(
+    (entityType: 'clinic', entityId: clinicId, planType: 'clinic_monthly'),
+  ));
+  final blocked = !access.allows(
+    SubscriptionFeature.newPatientRegistration,
+  );
+
+  if (blocked) {
+    return FloatingActionButton.extended(
+      onPressed: () =>
+          _showAddPatientUpgradeDialog(context, ref, clinicId),
+      backgroundColor: AppColors.warning,
+      foregroundColor: Colors.white,
+      icon: const Icon(Icons.lock_outline_rounded),
+      label: const Text('Renew to add patient'),
+    );
+  }
+
+  return FloatingActionButton.extended(
+    onPressed: () => _openAddPatient(context, clinicId),
+    backgroundColor: AppColors.primary,
+    foregroundColor: Colors.white,
+    icon: const Icon(Icons.person_add_alt_1_rounded),
+    label: const Text('New Patient'),
+  );
+}
+
+  Future<void> _showUpgradeDialog(
+      BuildContext context, String clinicId) async {
+    final renew = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Row(children: [
+          const Icon(Icons.lock_outline_rounded, color: AppColors.warning),
+          const SizedBox(width: 10),
+          Expanded(
+            child:
+                Text('Subscription inactive', style: AppTextStyles.h3),
+          ),
+        ]),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Registering new patients requires an active subscription.',
+              style: AppTextStyles.body,
+            ),
+            const SizedBox(height: 10),
+            Text(
+              'Your existing patients remain fully accessible — you can '
+              'check them in, view records, collect fees, and manage '
+              'their appointments.',
+              style: AppTextStyles.bodyMuted,
+            ),
+            const SizedBox(height: 10),
+            Text(
+              'Renew to resume new registrations, staff invitations, '
+              'analytics, and bulk exports.',
+              style: AppTextStyles.caption
+                  .copyWith(color: AppColors.info),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Not now'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Renew now'),
+          ),
+        ],
+      ),
+    );
+
+    if (renew == true && context.mounted) {
+      _openCheckout(context, clinicId);
     }
   }
+
+  Future<void> _openAddPatient(BuildContext context, String clinicId) async {
+  final added = await _openAddPatientIfAllowed(
+    context: context,
+    ref: ref,
+    clinicId: clinicId,
+  );
+  if (added) {
+    ref.invalidate(todayAllAppointmentsProvider);
+    ref.invalidate(todayInvoiceStatsProvider);
+    ref.invalidate(routedToDoctorProvider);
+    ref.invalidate(pendingRequestsProvider);
+    ref.invalidate(appointmentsForDayProvider(_queueDay));
+  }
+}
 
   // -------------------------------------------------------------
   // Search
@@ -205,7 +427,7 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
   }
 
   // -------------------------------------------------------------
-  // Needs attention (unchanged)
+  // Needs attention
   // -------------------------------------------------------------
   Widget _needsAttention(
     BuildContext context,
@@ -328,7 +550,7 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
       );
 
   // -------------------------------------------------------------
-  // Today at a glance (unchanged)
+  // Today at a glance
   // -------------------------------------------------------------
   Widget _glanceGrid(
       AsyncValue<List<AppointmentModel>> todayAsync,
@@ -431,7 +653,7 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
       );
 
   // -------------------------------------------------------------
-  // Today by doctor (unchanged)
+  // Today by doctor
   // -------------------------------------------------------------
   Widget _byDoctor(AsyncValue<List<AppointmentModel>> todayAsync) {
     final today = todayAsync.asData?.value ?? const <AppointmentModel>[];
@@ -500,7 +722,7 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
       );
 
   // -------------------------------------------------------------
-  // Today by slot (unchanged)
+  // Today by slot
   // -------------------------------------------------------------
   Widget _bySlot(AsyncValue<List<AppointmentModel>> todayAsync) {
     final today = todayAsync.asData?.value ?? const <AppointmentModel>[];
@@ -573,7 +795,7 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
   }
 
   // -------------------------------------------------------------
-  // Queue list (unchanged)
+  // Queue list
   // -------------------------------------------------------------
   Widget _queueList(AsyncValue<List<AppointmentModel>> dayAsync) {
     return dayAsync.when(
@@ -610,7 +832,7 @@ class _ReceptionistDashboardState extends ConsumerState<ReceptionistDashboard> {
   }
 
   // -------------------------------------------------------------
-  // Routed list (unchanged)
+  // Routed list
   // -------------------------------------------------------------
   Widget _routedList(AsyncValue<List<AppointmentModel>> routedAsync) {
     return routedAsync.when(
@@ -675,7 +897,7 @@ class _GlanceTile {
 }
 
 // ----------------------------------------------------------------
-// Queue row — unchanged
+// Queue row
 // ----------------------------------------------------------------
 class _SimpleQueueRow extends ConsumerWidget {
   final AppointmentModel appointment;
@@ -1141,7 +1363,7 @@ class _SimpleQueueRow extends ConsumerWidget {
 }
 
 // ----------------------------------------------------------------
-// Force-complete fees dialog — unchanged
+// Force-complete fees dialog
 // ----------------------------------------------------------------
 class _ReceptionFeesDialog extends StatefulWidget {
   const _ReceptionFeesDialog();
@@ -1212,7 +1434,7 @@ class _ReceptionFeesDialogState extends State<_ReceptionFeesDialog> {
 }
 
 // ----------------------------------------------------------------
-// Routed row — unchanged
+// Routed row
 // ----------------------------------------------------------------
 class _RoutedRow extends ConsumerWidget {
   final AppointmentModel appointment;
@@ -1309,7 +1531,7 @@ class _RoutedRow extends ConsumerWidget {
 }
 
 // ----------------------------------------------------------------
-// Patient search results — UPDATED: also searches linked labs
+// Patient search results
 // ----------------------------------------------------------------
 class _PatientSearchResults extends ConsumerStatefulWidget {
   final String query;
@@ -1322,7 +1544,6 @@ class _PatientSearchResults extends ConsumerStatefulWidget {
 
 class _PatientSearchResultsState
     extends ConsumerState<_PatientSearchResults> {
-  // NEW: lab customer matches surfaced alongside clinic patients
   bool _searchingLabs = true;
   List<LabCustomerMatch> _labMatches = const [];
 
@@ -1332,29 +1553,29 @@ class _PatientSearchResultsState
     _searchLinkedLabs();
   }
 
- Future<void> _searchLinkedLabs() async {
-  try {
-    final user = await ref.read(currentUserProvider.future);
-    if (user?.clinicId == null) {
+  Future<void> _searchLinkedLabs() async {
+    try {
+      final user = await ref.read(currentUserProvider.future);
+      if (user?.clinicId == null) {
+        if (mounted) setState(() => _searchingLabs = false);
+        return;
+      }
+      final matches = await ref
+          .read(patientServiceProvider)
+          .findLabCustomersAcrossLinkedLabs(
+            clinicId: user!.clinicId!,
+            name: widget.query.trim(),
+          );
+      if (mounted) {
+        setState(() {
+          _labMatches = matches;
+          _searchingLabs = false;
+        });
+      }
+    } catch (_) {
       if (mounted) setState(() => _searchingLabs = false);
-      return;
     }
-    final matches = await ref
-        .read(patientServiceProvider)
-        .findLabCustomersAcrossLinkedLabs(
-          clinicId: user!.clinicId!,
-          name: widget.query.trim(),   // method auto-detects phone/email/name
-        );
-    if (mounted) {
-      setState(() {
-        _labMatches = matches;
-        _searchingLabs = false;
-      });
-    }
-  } catch (_) {
-    if (mounted) setState(() => _searchingLabs = false);
   }
-}
 
   @override
   Widget build(BuildContext context) {
@@ -1377,40 +1598,7 @@ class _PatientSearchResultsState
             final hasClinic = list.isNotEmpty;
             final hasLab = _labMatches.isNotEmpty;
             final loading = _searchingLabs;
-
-            if (!hasClinic && !hasLab && !loading) {
-              return Center(
-                child: Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(Icons.search_off_rounded,
-                          size: 48, color: AppColors.textMuted),
-                      const SizedBox(height: 12),
-                      Text('No patients matched "${widget.query}"',
-                          style: AppTextStyles.bodyMuted,
-                          textAlign: TextAlign.center),
-                      const SizedBox(height: 20),
-                      ElevatedButton.icon(
-                        onPressed: () async {
-                          final added = await Navigator.of(context).push<bool>(
-                            MaterialPageRoute(
-                                builder: (_) => const AddPatientScreen()),
-                          );
-                          if (added == true && context.mounted) {
-                            Navigator.of(context).pop();
-                          }
-                        },
-                        icon: const Icon(Icons.person_add_alt_1_rounded),
-                        label: const Text('Create new patient'),
-                      ),
-                    ],
-                  ),
-                ),
-              );
-            }
-
+   
             return ListView(
               padding: const EdgeInsets.all(16),
               children: [
@@ -1456,7 +1644,6 @@ class _PatientSearchResultsState
     );
   }
 
-  // NEW: lab match card with "Register as clinic patient" action
   Widget _labMatchCard(BuildContext context, LabCustomerMatch m) {
     return GlassCard(
       borderColor: AppColors.info.withOpacity(.4),
@@ -1494,27 +1681,53 @@ class _PatientSearchResultsState
               ),
             ]),
             const SizedBox(height: 10),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: () async {
-                  final added = await Navigator.of(context).push<bool>(
-  MaterialPageRoute(
-      builder: (_) => AddPatientScreen(prefill: m)),
-);
-                  if (added == true && context.mounted) {
-                    Navigator.of(context).pop();
-                  }
-                },
-                icon: const Icon(Icons.person_add_alt_1_rounded, size: 16),
-                label: const Text('Register as clinic patient'),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: AppColors.info,
-                  side: const BorderSide(color: AppColors.info),
-                ),
-              ),
-            ),
-          ],
+           Consumer(builder: (context, ref, _) {
+  final user = ref.watch(currentUserProvider).valueOrNull;
+  final clinicId = user?.clinicId ?? '';
+  if (clinicId.isEmpty) return const SizedBox.shrink();
+
+  final access = ref.watch(subscriptionAccessProvider(
+    (entityType: 'clinic', entityId: clinicId, planType: 'clinic_monthly'),
+  ));
+  final blocked = !access.allows(
+    SubscriptionFeature.newPatientRegistration,
+  );
+
+  return SizedBox(
+    width: double.infinity,
+    child: OutlinedButton.icon(
+      onPressed: () async {
+        final added = await _openAddPatientIfAllowed(
+          context: context,
+          ref: ref,
+          clinicId: clinicId,
+          prefill: m,
+        );
+        if (added && context.mounted) {
+          Navigator.of(context).pop();
+        }
+      },
+      icon: Icon(
+        blocked
+            ? Icons.lock_outline_rounded
+            : Icons.person_add_alt_1_rounded,
+        size: 16,
+      ),
+      label: Text(
+        blocked
+            ? 'Renew to register as clinic patient'
+            : 'Register as clinic patient',
+      ),
+      style: OutlinedButton.styleFrom(
+        foregroundColor: blocked ? AppColors.warning : AppColors.info,
+        side: BorderSide(
+          color: blocked ? AppColors.warning : AppColors.info,
+        ),
+      ),
+    ),
+  );
+}),
+       ],
         ),
       ),
     );
@@ -1575,7 +1788,7 @@ class _PatientSearchResultsState
 }
 
 // ----------------------------------------------------------------
-// Menu row helper — unchanged
+// Menu row helper
 // ----------------------------------------------------------------
 class _MenuRow extends StatelessWidget {
   final IconData icon;

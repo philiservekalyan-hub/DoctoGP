@@ -1,10 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../../app/router.dart';
 import '../../../app/theme/app_colors.dart';
 import 'patient_dashboard.dart';
-import 'my_appointments_screen.dart';
+import 'pill_reminder_screen.dart';       
 import 'my_reports_screen.dart';
 
 class PatientShell extends ConsumerStatefulWidget {
@@ -18,7 +17,7 @@ class _PatientShellState extends ConsumerState<PatientShell> {
 
   final _screens = const [
     PatientDashboard(),
-    MyAppointmentsScreen(),
+    PillReminderScreen(),                 
     MyReportsScreen(),
   ];
 
@@ -40,9 +39,9 @@ class _PatientShellState extends ConsumerState<PatientShell> {
               label: 'Home',
             ),
             BottomNavigationBarItem(
-              icon: Icon(Icons.calendar_today_outlined),
-              activeIcon: Icon(Icons.calendar_today_rounded),
-              label: 'Appointments',
+              icon: Icon(Icons.medication_outlined),         
+              activeIcon: Icon(Icons.medication_rounded),     
+              label: 'Pill Guard',                            
             ),
             BottomNavigationBarItem(
               icon: Icon(Icons.description_outlined),

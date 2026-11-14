@@ -1,3 +1,4 @@
+// lib/shared/widgets/clinic_app_bar.dart
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -25,24 +26,24 @@ class ClinicAppBar extends ConsumerWidget implements PreferredSizeWidget {
   @override
   Size get preferredSize => const Size.fromHeight(64);
 
-   @override
+  @override
   Widget build(BuildContext context, WidgetRef ref) {
     final user = ref.watch(currentUserProvider).valueOrNull;
     final clinicAsync = ref.watch(currentClinicProvider);
 
     final clinicName = user?.role == UserRole.admin
-    ? 'STAT Admin'
-    : clinicAsync.maybeWhen(
-        data: (c) => c?.name ?? 'Clinic',
-        orElse: () => 'Clinic',
-      );
+        ? 'STAT Admin'
+        : user?.role == UserRole.chemist
+            ? 'STAT Pharmacy'
+            : clinicAsync.maybeWhen(
+                data: (c) => c?.name ?? 'Clinic',
+                orElse: () => 'Clinic',
+              );
 
     final roleLabel = user?.roleLabel ?? '';
     final roleColor = _roleColor(user?.role);
     final roleIcon = _roleIcon(user?.role);
 
-    // Decide whether the role chip can fit. On narrow screens we drop it
-    // and rely on the dashboard body's role indication instead.
     final screenWidth = MediaQuery.of(context).size.width;
     final showRoleChip = roleLabel.isNotEmpty && screenWidth >= 400;
 
@@ -55,19 +56,28 @@ class ClinicAppBar extends ConsumerWidget implements PreferredSizeWidget {
       title: Row(
         children: [
           // Brand mark
-          Container(
-            width: 34,
-            height: 34,
-            decoration: BoxDecoration(
-              gradient: AppColors.primaryGradient,
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: const Icon(
-              Icons.local_hospital_rounded,
-              color: AppColors.background,
-              size: 18,
-            ),
-          ),
+ClipRRect(
+  borderRadius: BorderRadius.circular(10),
+  child: Image.asset(
+    'assets/images/icon.png',
+    width: 34,
+    height: 34,
+    fit: BoxFit.cover,
+    errorBuilder: (_, __, ___) => Container(
+      width: 34,
+      height: 34,
+      decoration: BoxDecoration(
+        gradient: AppColors.primaryGradient,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: const Icon(
+        Icons.local_hospital_rounded,
+        color: AppColors.background,
+        size: 18,
+      ),
+    ),
+  ),
+),
           const SizedBox(width: 10),
           Expanded(
             child: Column(
@@ -146,28 +156,48 @@ class ClinicAppBar extends ConsumerWidget implements PreferredSizeWidget {
   }
 
   Color _roleColor(UserRole? role) {
-  switch (role) {
-    case UserRole.patient: return AppColors.patientAccent;
-    case UserRole.owner: return AppColors.secondary;
-    case UserRole.receptionist: return AppColors.receptionAccent;
-    case UserRole.doctor: return AppColors.doctorAccent;
-    case UserRole.nurse: return AppColors.nurseAccent;
-    case UserRole.lab: return AppColors.labAccent;
-    case UserRole.admin: return AppColors.secondary;
-    default: return AppColors.textMuted;
+    switch (role) {
+      case UserRole.patient:
+        return AppColors.patientAccent;
+      case UserRole.owner:
+        return AppColors.secondary;
+      case UserRole.receptionist:
+        return AppColors.receptionAccent;
+      case UserRole.doctor:
+        return AppColors.doctorAccent;
+      case UserRole.nurse:
+        return AppColors.nurseAccent;
+      case UserRole.lab:
+        return AppColors.labAccent;
+      case UserRole.admin:
+        return AppColors.secondary;
+      case UserRole.chemist:
+        return AppColors.patientAccent;
+      default:
+        return AppColors.textMuted;
+    }
   }
-}
 
-IconData _roleIcon(UserRole? role) {
-  switch (role) {
-    case UserRole.patient: return Icons.person_rounded;
-    case UserRole.owner: return Icons.business_center_rounded;
-    case UserRole.receptionist: return Icons.support_agent_rounded;
-    case UserRole.doctor: return Icons.medical_services_rounded;
-    case UserRole.nurse: return Icons.volunteer_activism_rounded;
-    case UserRole.lab: return Icons.science_rounded;
-    case UserRole.admin: return Icons.shield_rounded;
-    default: return Icons.person_outline_rounded;
+  IconData _roleIcon(UserRole? role) {
+    switch (role) {
+      case UserRole.patient:
+        return Icons.person_rounded;
+      case UserRole.owner:
+        return Icons.business_center_rounded;
+      case UserRole.receptionist:
+        return Icons.support_agent_rounded;
+      case UserRole.doctor:
+        return Icons.medical_services_rounded;
+      case UserRole.nurse:
+        return Icons.volunteer_activism_rounded;
+      case UserRole.lab:
+        return Icons.science_rounded;
+      case UserRole.admin:
+        return Icons.shield_rounded;
+      case UserRole.chemist:
+        return Icons.local_pharmacy_rounded;
+      default:
+        return Icons.person_outline_rounded;
+    }
   }
-}
 }

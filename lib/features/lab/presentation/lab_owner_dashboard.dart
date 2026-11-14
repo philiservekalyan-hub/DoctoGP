@@ -20,7 +20,7 @@ import '../../../core/widgets/glass_card.dart';
 import '../../../core/widgets/section_header.dart';
 import '../../../shared/widgets/role_badge.dart';
 import 'lab_team_screen.dart';
-
+import '../../subscription/widgets/subscription_card.dart';
 // ═══════════════════════════════════════════════════════════════════
 // DATA PROVIDERS
 // ═══════════════════════════════════════════════════════════════════
@@ -230,6 +230,7 @@ class _ValueCtl<T> {
     value = v;
     _notify?.call();
   }
+
   void error(Object e) => _onError?.call(e);
   void Function()? _notify;
 }
@@ -242,6 +243,7 @@ Stream<void> _merge(List<_ValueCtl> controllers) {
     remaining--;
     if (remaining <= 0) ctl.add(null);
   }
+
   for (final c in controllers) {
     c._notify = check;
     c._onError = ctl.addError;
@@ -272,30 +274,30 @@ class LabOwnerDashboard extends ConsumerWidget {
         elevation: 0,
         title: Text('Lab dashboard', style: AppTextStyles.h3),
         actions: [
-  // Toggle to the lab operations dashboard.
-  if (isOwner && canPractise)
-    IconButton(
-      tooltip: 'Open lab dashboard',
-      onPressed: () => context.push('/lab/tech'),
-      icon: const Icon(
-        Icons.biotech_rounded,
-        color: AppColors.textSecondary,
-        size: 20,
-      ),
-    ),
-  IconButton(
-    tooltip: 'Refresh',
-    onPressed: () => ref.invalidate(labOwnerSnapshotProvider),
-    icon: const Icon(Icons.refresh_rounded,
-        color: AppColors.textSecondary, size: 20),
-  ),
-  IconButton(
-    tooltip: 'Logout',
-    onPressed: () => _confirmLogout(context),
-    icon: const Icon(Icons.logout_rounded, color: AppColors.error),
-  ),
-  const SizedBox(width: 4),
-],
+          // Toggle to the lab operations dashboard.
+          if (isOwner && canPractise)
+            IconButton(
+              tooltip: 'Open lab dashboard',
+              onPressed: () => context.go('/lab/tech'),
+              icon: const Icon(
+                Icons.biotech_rounded,
+                color: AppColors.textSecondary,
+                size: 20,
+              ),
+            ),
+          IconButton(
+            tooltip: 'Refresh',
+            onPressed: () => ref.invalidate(labOwnerSnapshotProvider),
+            icon: const Icon(Icons.refresh_rounded,
+                color: AppColors.textSecondary, size: 20),
+          ),
+          IconButton(
+            tooltip: 'Logout',
+            onPressed: () => _confirmLogout(context),
+            icon: const Icon(Icons.logout_rounded, color: AppColors.error),
+          ),
+          const SizedBox(width: 4),
+        ],
       ),
       body: SafeArea(
         child: userAsync.when(
@@ -303,7 +305,14 @@ class LabOwnerDashboard extends ConsumerWidget {
               child: CircularProgressIndicator(color: AppColors.primary)),
           error: (e, _) => Center(child: Text('$e')),
           data: (user) {
-            final labClinicId = user?.clinicId;
+            // During logout, user is null. Don't flash the empty state —
+            // the router (with refreshListenable) navigates to /login on
+            // the same frame.
+            if (user == null) {
+              return const SizedBox.shrink();
+            }
+
+            final labClinicId = user.clinicId;
             if (labClinicId == null || labClinicId.isEmpty) {
               return const Center(
                   child: Text('No lab linked to your account.'));
@@ -318,38 +327,42 @@ class LabOwnerDashboard extends ConsumerWidget {
                 onRefresh: () async =>
                     ref.invalidate(labOwnerSnapshotProvider),
                 child: ListView(
-                  padding: const EdgeInsets.all(20),
-                  children: [
-                    _header(context, user?.name ?? 'Lab owner'),
-                    const SizedBox(height: 20),
-                    _overviewCards(snap),
-                    const SizedBox(height: 24),
-                    const SectionHeader(title: 'Revenue — last 7 days'),
-                    const SizedBox(height: 8),
-                    _revenueChart(snap),
-                    const SizedBox(height: 24),
-                    const SectionHeader(title: 'Order pipeline'),
-                    const SizedBox(height: 8),
-                    _pipelineChart(snap),
-                    const SizedBox(height: 24),
-                    const SectionHeader(title: 'Top tests this month'),
-                    const SizedBox(height: 8),
-                    _topTests(snap),
-                    const SizedBox(height: 24),
-                    const SectionHeader(title: 'Catalogue summary'),
-                    const SizedBox(height: 8),
-                    _catalogueSummary(snap),
-                    const SizedBox(height: 24),
-                    const SectionHeader(title: 'Team'),
-                    const SizedBox(height: 8),
-                    _teamSummary(context, snap),
-                    const SizedBox(height: 24),
-                    const SectionHeader(title: 'Reports'),
-                    const SizedBox(height: 8),
-                    _reports(context, snap),
-                    const SizedBox(height: 40),
-                  ],
-                ),
+  padding: const EdgeInsets.all(20),
+  children: [
+    _header(context, user.name),
+    const SizedBox(height: 20),
+    _overviewCards(snap),
+    const SizedBox(height: 24),
+    const SectionHeader(title: 'Account'),
+const SizedBox(height: 8),
+const SubscriptionCard(entityType: 'lab'),
+const SizedBox(height: 24),     
+    const SectionHeader(title: 'Revenue — last 7 days'),
+    const SizedBox(height: 8),
+    _revenueChart(snap),
+    const SizedBox(height: 24),
+    const SectionHeader(title: 'Order pipeline'),
+    const SizedBox(height: 8),
+    _pipelineChart(snap),
+    const SizedBox(height: 24),
+    const SectionHeader(title: 'Top tests this month'),
+    const SizedBox(height: 8),
+    _topTests(snap),
+    const SizedBox(height: 24),
+    const SectionHeader(title: 'Catalogue summary'),
+    const SizedBox(height: 8),
+    _catalogueSummary(snap),
+    const SizedBox(height: 24),
+    const SectionHeader(title: 'Team'),
+    const SizedBox(height: 8),
+    _teamSummary(context, snap),
+    const SizedBox(height: 24),
+    const SectionHeader(title: 'Reports'),
+    const SizedBox(height: 8),
+    _reports(context, snap),
+    const SizedBox(height: 40),
+  ],
+),
               ),
             );
           },
@@ -383,10 +396,13 @@ class LabOwnerDashboard extends ConsumerWidget {
     if (ok != true) return;
     try {
       await FirebaseAuth.instance.signOut();
-      // Router's redirect fires when authStateProvider emits null:
-      //   currentUserProvider → null → redirect to /login
-      //   labOwnerSnapshotProvider watches currentUserProvider,
-      //   sees null, and returns Stream.empty() on its own.
+      // The router (router.dart) has a refreshListenable hooked to
+      // authStateChanges(), so it navigates to /login automatically.
+      // Explicit go() is a fallback in case the router isn't attached.
+      if (context.mounted &&
+          GoRouterState.of(context).matchedLocation != '/login') {
+        context.go('/login');
+      }
     } catch (e) {
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -753,7 +769,6 @@ class LabOwnerDashboard extends ConsumerWidget {
   }
 
   // ── Team summary ──
-
   Widget _teamSummary(BuildContext context, LabOwnerSnapshot snap) {
     int countRole(String role) => snap.teamMembers
         .where((m) => m['role']?.toString() == role)
@@ -894,7 +909,6 @@ class LabOwnerDashboard extends ConsumerWidget {
   }
 
   // ── CSV exports ──
-
   Future<void> _exportOrdersCsv(
       BuildContext context, LabOwnerSnapshot snap) async {
     final buf = StringBuffer();
@@ -984,7 +998,8 @@ class LabOwnerDashboard extends ConsumerWidget {
       BuildContext context, String baseName, String content) async {
     try {
       final dir = await getApplicationDocumentsDirectory();
-      final name = '${baseName}_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}.csv';
+      final name =
+          '${baseName}_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}.csv';
       final file = File('${dir.path}/$name');
       await file.writeAsString(content);
       if (!context.mounted) return;
@@ -1002,7 +1017,7 @@ class LabOwnerDashboard extends ConsumerWidget {
     }
   }
 
-    void _openPrintPreview(BuildContext context, LabOwnerSnapshot snap) {
+  void _openPrintPreview(BuildContext context, LabOwnerSnapshot snap) {
     showDialog<void>(
       context: context,
       builder: (dctx) => AlertDialog(

@@ -230,12 +230,26 @@ class LabTestCatalogScreen extends ConsumerWidget {
 
     switch (choice) {
       case 'canonical':
+  // Pull the current catalogue so the picker can mark already-added tests.
+  final existingTestIds = ref
+      .read(_catalogProvider(labClinicId))
+      .maybeWhen(
+        data: (tests) => tests
+            .where((t) => t['isLocal'] != true)
+            .map((t) => (t['testId'] ?? '').toString())
+            .where((s) => s.isNotEmpty)
+            .toSet(),
+        orElse: () => <String>{},
+      );
+
   final chosen = await showModalBottomSheet<List<String>>(
     context: context,
     isScrollControlled: true,
     backgroundColor: Colors.transparent,
-    builder: (_) =>
-        CanonicalTestPickerSheet(labClinicId: labClinicId),
+    builder: (_) => CanonicalTestPickerSheet(
+      labClinicId: labClinicId,
+      existingTestIds: existingTestIds,
+    ),
   );
   if (chosen == null || chosen.isEmpty) break;
 

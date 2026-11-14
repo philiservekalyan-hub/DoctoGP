@@ -15,6 +15,7 @@ import '../features/auth/presentation/login_screen.dart';
 import '../features/auth/presentation/signup_screen.dart';
 import '../features/auth/presentation/splash_screen.dart';
 import '../features/doctor/presentation/doctor_shell.dart';
+import '../features/chemist/presentation/chemist_dashboard.dart';
 import '../features/lab/presentation/lab_dashboard.dart';
 import '../features/lab/presentation/lab_receptionist_dashboard.dart';
 import '../features/lab/presentation/lab_shell.dart';
@@ -23,6 +24,8 @@ import '../features/owner/presentation/doctor_owner_dashboard.dart';
 import '../features/patient/presentation/patient_shell.dart';
 import '../features/receptionist/presentation/clinic_settings_screen.dart';
 import '../features/receptionist/presentation/receptionist_shell.dart';
+import '../features/lab/presentation/lab_owner_dashboard.dart'; 
+import '../features/subscription/widgets/subscription_checkout_screen.dart';
 
 final authServiceProvider = Provider<AuthService>((ref) => AuthService());
 
@@ -71,7 +74,6 @@ Future<String> _landingForUser(UserModel user) async {
     case UserRole.patient:
       return '/patient';
     case UserRole.owner:
-      // Lab owners → /lab. Clinic owners → /doctor/owner (DoctorOwnerDashboard).
       if (user.orgType == 'lab') return '/lab';
       if (user.orgType == 'clinic') return '/doctor/owner';
       if (user.clinicId == null || user.clinicId!.isEmpty) {
@@ -109,20 +111,50 @@ Future<String> _landingForUser(UserModel user) async {
         if (type == 'lab') return '/lab-reception';
       } catch (_) {}
       return '/reception';
+    case UserRole.chemist:
+      return '/chemist';
     default:
       return '/login';
   }
 }
 
 final routerProvider = Provider<GoRouter>((ref) {
+  // ─────────────────────────────────────────────────────────────────
+  // ROOT-CAUSE FIX
+  //
+  // GoRouter only re-runs `redirect` on navigation or when its
+  // `refreshListenable` notifies. Without one, calling
+  // `FirebaseAuth.instance.signOut()` clears auth but the router
+  // stays on the current (lab) screen. LabOwnerDashboard then
+  // re-renders with user == null → "No lab linked to your account",
+  // and the user has to click Logout again.
+  //
+  // Bridge authStateChanges() into a ValueNotifier and hand it to
+  // GoRouter. Sign-out (and sign-in) now instantly re-run redirect,
+  // which sees currentUser == null synchronously and navigates to
+  // /login — before the dashboard can render the empty state.
+  // ─────────────────────────────────────────────────────────────────
+  final authListenable =
+      ValueNotifier<User?>(FirebaseAuth.instance.currentUser);
+  final sub = FirebaseAuth.instance.authStateChanges().listen(
+    (u) => authListenable.value = u,
+  );
+  ref.onDispose(() {
+    sub.cancel();
+    authListenable.dispose();
+  });
+
   return GoRouter(
     initialLocation: '/',
+    refreshListenable: authListenable,
     redirect: (context, state) async {
       final location = state.matchedLocation;
       final isPublic = location == '/' ||
           location == '/login' ||
           location == '/signup';
 
+      // Synchronous short-circuit: the instant signOut() completes,
+      // this returns '/login' without awaiting any Firestore read.
       if (FirebaseAuth.instance.currentUser == null) {
         return isPublic ? null : '/login';
       }
@@ -157,68 +189,43 @@ final routerProvider = Provider<GoRouter>((ref) {
       return null;
     },
     routes: [
+      GoRoute(path: '/', builder: (_, __) => const SplashScreen()),
+      GoRoute(path: '/login', builder: (_, __) => const LoginScreen()),
+      GoRoute(path: '/signup', builder: (_, __) => const SignupScreen()),
+      GoRoute(path: '/patient', builder: (_, __) => const PatientShell()),
+      GoRoute(path: '/reception', builder: (_, __) => const ReceptionistShell()),
       GoRoute(
-        path: '/',
-        builder: (_, __) => const SplashScreen(),
-      ),
+          path: '/lab-reception',
+          builder: (_, __) => const LabReceptionistDashboard()),
+      GoRoute(path: '/doctor', builder: (_, __) => const DoctorShell()),
       GoRoute(
-        path: '/login',
-        builder: (_, __) => const LoginScreen(),
-      ),
+          path: '/doctor/owner',
+          builder: (_, __) => const DoctorOwnerDashboard()),
       GoRoute(
-        path: '/signup',
-        builder: (_, __) => const SignupScreen(),
-      ),
+  path: '/subscription/checkout',
+  builder: (context, state) {
+    final q = state.uri.queryParameters;
+    return SubscriptionCheckoutScreen(
+      entityType: q['entityType'] ?? '',
+      entityId: q['entityId'] ?? '',
+      planType: q['planType'] ?? '',
+    );
+  },
+),
+
+      GoRoute(path: '/chemist', builder: (_, __) => const ChemistDashboard()),
+      GoRoute(path: '/nurse', builder: (_, __) => const NurseShell()),
+      GoRoute(path: '/lab', builder: (_, __) => const LabShell()),
+      GoRoute(path: '/lab/tech', builder: (_, __) => const LabDashboard()),
+      GoRoute(path: '/lab-owner', builder: (_, __) => const LabOwnerDashboard()), 
+      GoRoute(path: '/owner', builder: (_, __) => const DoctorOwnerDashboard()),
+      GoRoute(path: '/admin', builder: (_, __) => const AdminShell()),
       GoRoute(
-        path: '/patient',
-        builder: (_, __) => const PatientShell(),
-      ),
+          path: '/admin/create-clinic',
+          builder: (_, __) => const CreateClinicScreen()),
       GoRoute(
-        path: '/reception',
-        builder: (_, __) => const ReceptionistShell(),
-      ),
-      GoRoute(
-        path: '/lab-reception',
-        builder: (_, __) => const LabReceptionistDashboard(),
-      ),
-      GoRoute(
-        path: '/doctor',
-        builder: (_, __) => const DoctorShell(),
-      ),
-      GoRoute(
-        path: '/doctor/owner',
-        builder: (_, __) => const DoctorOwnerDashboard(),
-      ),
-      GoRoute(
-        path: '/nurse',
-        builder: (_, __) => const NurseShell(),
-      ),
-      GoRoute(
-        path: '/lab',
-        builder: (_, __) => const LabShell(),
-      ),
-      GoRoute(
-        path: '/lab/tech',
-        builder: (_, __) => const LabDashboard(),
-      ),
-      // Alias kept so any old '/owner' deep-link still lands on the
-      // owner dashboard (previously OwnerShell).
-      GoRoute(
-        path: '/owner',
-        builder: (_, __) => const DoctorOwnerDashboard(),
-      ),
-      GoRoute(
-        path: '/admin',
-        builder: (_, __) => const AdminShell(),
-      ),
-      GoRoute(
-        path: '/admin/create-clinic',
-        builder: (_, __) => const CreateClinicScreen(),
-      ),
-      GoRoute(
-        path: '/clinic-settings',
-        builder: (_, __) => const ClinicSettingsScreen(),
-      ),
+          path: '/clinic-settings',
+          builder: (_, __) => const ClinicSettingsScreen()),
     ],
   );
 });

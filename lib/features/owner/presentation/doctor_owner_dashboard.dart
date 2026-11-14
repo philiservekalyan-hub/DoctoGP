@@ -22,6 +22,7 @@ import '../../../shared/widgets/clinic_app_bar.dart';
 import '../../staff/presentation/add_staff_screen.dart';
 import 'clinic_settings_screen_owner.dart';
 import 'team_list_screen.dart';
+import '../../subscription/widgets/subscription_card.dart';
 
 // ═══════════════════════════════════════════════════════════════════
 // DATA PROVIDERS
@@ -29,28 +30,37 @@ import 'team_list_screen.dart';
 
 class DoctorOwnerSnapshot {
   final List<Map<String, dynamic>> patients;
+  /// Merged visit maps — each contains the appointment fields plus
+  /// `consultation` (map|null), `diagnosis`, `diagnosisCode`,
+  /// `diagnosisText`, `notes`, `rx`, `symptoms`, `followUpPlan`,
+  /// `medications` (flattened list), `labOrders` (list).
   final List<Map<String, dynamic>> visits;
-  final List<Map<String, dynamic>> prescriptions;
   final List<Map<String, dynamic>> labOrders;
   final List<Map<String, dynamic>> teamMembers;
 
   DoctorOwnerSnapshot({
     required this.patients,
     required this.visits,
-    required this.prescriptions,
     required this.labOrders,
     required this.teamMembers,
   });
 
+  // ── Counts ──
   int get totalPatients => patients.length;
   int get totalVisits => visits.length;
+
+  // ── Visit timestamp resolver ──
+  static Timestamp? _visitTs(Map<String, dynamic> v) {
+    final a = v['consultStartedAt'] ?? v['createdAt'] ?? v['slot'];
+    return a is Timestamp ? a : null;
+  }
 
   List<Map<String, dynamic>> get todayVisits {
     final now = DateTime.now();
     final start = DateTime(now.year, now.month, now.day);
     return visits.where((v) {
-      final ts = v['visitedAt'];
-      if (ts is! Timestamp) return false;
+      final ts = _visitTs(v);
+      if (ts == null) return false;
       return !ts.toDate().isBefore(start);
     }).toList();
   }
@@ -60,8 +70,8 @@ class DoctorOwnerSnapshot {
     final monday = DateTime(now.year, now.month, now.day)
         .subtract(Duration(days: now.weekday - 1));
     return visits.where((v) {
-      final ts = v['visitedAt'];
-      if (ts is! Timestamp) return false;
+      final ts = _visitTs(v);
+      if (ts == null) return false;
       return !ts.toDate().isBefore(monday);
     }).toList();
   }
@@ -70,12 +80,13 @@ class DoctorOwnerSnapshot {
     final now = DateTime.now();
     final monthStart = DateTime(now.year, now.month, 1);
     return visits.where((v) {
-      final ts = v['visitedAt'];
-      if (ts is! Timestamp) return false;
+      final ts = _visitTs(v);
+      if (ts == null) return false;
       return !ts.toDate().isBefore(monthStart);
     }).toList();
   }
 
+  // ── Revenue ──
   double get todayCollected {
     final now = DateTime.now();
     final start = DateTime(now.year, now.month, now.day);
@@ -85,7 +96,7 @@ class DoctorOwnerSnapshot {
       final ts = v['feesPaidAt'];
       if (ts is! Timestamp) continue;
       if (ts.toDate().isBefore(start)) continue;
-      sum += (v['consultationFee'] as num?)?.toDouble() ?? 0;
+      sum += (v['consultationFees'] as num?)?.toDouble() ?? 0;
     }
     return sum;
   }
@@ -97,38 +108,12 @@ class DoctorOwnerSnapshot {
       if (status == 'cancelled' || status == 'noShow') continue;
       final paid = v['paymentStatus']?.toString();
       if (paid == 'paid' || paid == 'waived') continue;
-      sum += (v['consultationFee'] as num?)?.toDouble() ?? 0;
+      sum += (v['consultationFees'] as num?)?.toDouble() ?? 0;
     }
     return sum;
   }
 
-  List<Map<String, dynamic>> get followUpsDue {
-    final now = DateTime.now();
-    final start = DateTime(now.year, now.month, now.day);
-    final end = start.add(const Duration(days: 7));
-    return visits.where((v) {
-      final ts = v['nextFollowUpAt'];
-      if (ts is! Timestamp) return false;
-      final d = ts.toDate();
-      return !d.isBefore(start) && d.isBefore(end);
-    }).toList()
-      ..sort((a, b) {
-        final aTs = a['nextFollowUpAt'] as Timestamp;
-        final bTs = b['nextFollowUpAt'] as Timestamp;
-        return aTs.compareTo(bTs);
-      });
-  }
-
-  List<Map<String, dynamic>> get overdueFollowUps {
-    final now = DateTime.now();
-    final start = DateTime(now.year, now.month, now.day);
-    return visits.where((v) {
-      final ts = v['nextFollowUpAt'];
-      if (ts is! Timestamp) return false;
-      return ts.toDate().isBefore(start);
-    }).toList();
-  }
-
+  // ── 7-day visit series ──
   List<({DateTime day, int count})> get lastSevenDays {
     final now = DateTime.now();
     final days = <({DateTime day, int count})>[];
@@ -138,8 +123,8 @@ class DoctorOwnerSnapshot {
       final nextDay = d.add(const Duration(days: 1));
       var count = 0;
       for (final v in visits) {
-        final ts = v['visitedAt'];
-        if (ts is! Timestamp) continue;
+        final ts = _visitTs(v);
+        if (ts == null) continue;
         final t = ts.toDate();
         if (t.isBefore(d) || !t.isBefore(nextDay)) continue;
         count++;
@@ -149,15 +134,18 @@ class DoctorOwnerSnapshot {
     return days;
   }
 
+  // ── Top diagnoses (from consultations) ──
   List<({String name, int count})> get topDiagnosesThisMonth {
     final now = DateTime.now();
     final monthStart = DateTime(now.year, now.month, 1);
     final counter = <String, int>{};
     for (final v in visits) {
-      final ts = v['visitedAt'];
-      if (ts is! Timestamp) continue;
-      if (ts.toDate().isBefore(monthStart)) continue;
-      final dx = v['diagnosis']?.toString() ?? '';
+      final c = v['consultation'];
+      if (c is! Map) continue;
+      final tsRaw = v['consultStartedAt'] ?? v['createdAt'] ?? v['slot'];
+      if (tsRaw is! Timestamp) continue;
+      if (tsRaw.toDate().isBefore(monthStart)) continue;
+      final dx = (c['diagnosis'] ?? '').toString().trim();
       if (dx.isEmpty) continue;
       counter[dx] = (counter[dx] ?? 0) + 1;
     }
@@ -168,6 +156,7 @@ class DoctorOwnerSnapshot {
     return list.take(5).toList();
   }
 
+  // ── Top tests ordered (from lab orders) ──
   List<({String name, int count})> get topTestsThisMonth {
     final now = DateTime.now();
     final monthStart = DateTime(now.year, now.month, 1);
@@ -194,31 +183,28 @@ class DoctorOwnerSnapshot {
     return list.take(5).toList();
   }
 
-  Map<String, dynamic>? patientById(String id) {
+  // ── Lookups ──
+  // `p['docId']` is the Firestore doc id; `p['patientId']` is the
+  // human-readable ID (e.g. PT-LFC-...).
+  Map<String, dynamic>? patientById(String docId) {
     for (final p in patients) {
-      if (p['patientId'] == id) return p;
+      if (p['docId'] == docId) return p;
     }
     return null;
   }
 
-  List<Map<String, dynamic>> visitsForPatient(String patientId) {
+  List<Map<String, dynamic>> visitsForPatient(String patientDocId) {
     final list = visits
-        .where((v) => v['patientId']?.toString() == patientId)
+        .where((v) => v['patientDocId']?.toString() == patientDocId)
         .toList();
     list.sort((a, b) {
-      final aTs = a['visitedAt'];
-      final bTs = b['visitedAt'];
-      if (aTs is Timestamp && bTs is Timestamp) return bTs.compareTo(aTs);
+      final aTs = _visitTs(a);
+      final bTs = _visitTs(b);
+      if (aTs != null && bTs != null) return bTs.compareTo(aTs);
       return 0;
     });
     return list;
   }
-
-  List<Map<String, dynamic>> prescriptionsForVisit(String visitId) =>
-      prescriptions.where((p) => p['visitId']?.toString() == visitId).toList();
-
-  List<Map<String, dynamic>> labOrdersForVisit(String visitId) =>
-      labOrders.where((o) => o['visitId']?.toString() == visitId).toList();
 }
 
 final doctorOwnerSnapshotProvider =
@@ -228,36 +214,36 @@ final doctorOwnerSnapshotProvider =
   if (clinicId == null || clinicId.isEmpty) return const Stream.empty();
   final db = FirebaseFirestore.instance;
 
+  // ── Raw streams ──
   final patientsStream = db
-      .collection('clinics')
-      .doc(clinicId)
       .collection('patients')
+      .where('clinicId', isEqualTo: clinicId)
       .snapshots()
       .map((s) => s.docs
-          .map((d) => <String, dynamic>{'patientId': d.id, ...d.data()})
+          .map((d) => <String, dynamic>{'docId': d.id, ...d.data()})
           .toList());
 
-  final visitsStream = db
-      .collection('clinics')
-      .doc(clinicId)
-      .collection('visits')
+  final appointmentsStream = db
+      .collection('appointments')
+      .where('clinicId', isEqualTo: clinicId)
       .snapshots()
       .map((s) => s.docs
           .map((d) => <String, dynamic>{'visitId': d.id, ...d.data()})
           .toList());
 
-  final prescriptionsStream = db
-      .collection('clinics')
-      .doc(clinicId)
-      .collection('prescriptions')
+  final consultationsStream = db
+      .collection('consultations')
+      .where('clinicId', isEqualTo: clinicId)
       .snapshots()
       .map((s) => s.docs
-          .map((d) => <String, dynamic>{'prescriptionId': d.id, ...d.data()})
+          .map((d) => <String, dynamic>{'consultationId': d.id, ...d.data()})
           .toList());
 
+  // Lab orders link to the referring clinic (the doctor's clinic),
+  // not to a generic `clinicId` field.
   final labOrdersStream = db
       .collection('labOrders')
-      .where('clinicId', isEqualTo: clinicId)
+      .where('referringClinicId', isEqualTo: clinicId)
       .snapshots()
       .map((s) => s.docs
           .map((d) => <String, dynamic>{'orderId': d.id, ...d.data()})
@@ -269,13 +255,100 @@ final doctorOwnerSnapshotProvider =
       .snapshots()
       .map((s) => s.docs
           .map((d) => <String, dynamic>{'uid': d.id, ...d.data()})
+          .where((m) => m['role']?.toString() != 'patient')
           .toList());
 
-  return _combine5(patientsStream, visitsStream, prescriptionsStream,
-      labOrdersStream, teamStream);
+  // ── Combine and merge ──
+  return _combine5(
+    patientsStream,
+    appointmentsStream,
+    consultationsStream,
+    labOrdersStream,
+    teamStream,
+  ).map((raw) {
+    final consultationsById = <String, Map<String, dynamic>>{
+      for (final c in raw.consultations)
+        (c['consultationId'] ?? '').toString(): c,
+    };
+
+    final labOrdersByAppt = <String, List<Map<String, dynamic>>>{};
+    for (final o in raw.labOrders) {
+      final aid = (o['appointmentId'] ?? '').toString();
+      if (aid.isEmpty) continue;
+      (labOrdersByAppt[aid] ??= []).add(o);
+    }
+
+    // Build merged visits — only completed appointments (real visits).
+    final visits = <Map<String, dynamic>>[];
+    for (final a in raw.appointments) {
+      final apptId = (a['visitId'] ?? '').toString();
+      final status = (a['status'] ?? '').toString();
+      final consult = consultationsById[apptId];
+
+      final isCompleted = status == 'completed';
+      final hasCompletedConsult =
+          consult != null && consult['endedAt'] != null;
+      if (!isCompleted && !hasCompletedConsult) continue;
+
+      final meds = <Map<String, dynamic>>[];
+      if (consult != null) {
+        final rawMeds = consult['medications'];
+        if (rawMeds is List) {
+          for (final m in rawMeds) {
+            if (m is Map) meds.add(Map<String, dynamic>.from(m));
+          }
+        }
+      }
+
+      visits.add(<String, dynamic>{
+        ...a,
+        'consultation': consult,
+        'diagnosis': consult?['diagnosis'],
+        'diagnosisCode': consult?['diagnosisCode'],
+        'diagnosisText': consult?['diagnosisText'],
+        'notes': consult?['notes'],
+        'rx': consult?['rx'],
+        'symptoms': consult?['symptoms'],
+        'followUpPlan': consult?['followUpPlan'],
+        'disposition': consult?['disposition'],
+        'medications': meds,
+        'labOrders': labOrdersByAppt[apptId] ?? const [],
+      });
+    }
+    visits.sort((a, b) {
+      final aTs = DoctorOwnerSnapshot._visitTs(a);
+      final bTs = DoctorOwnerSnapshot._visitTs(b);
+      if (aTs != null && bTs != null) return bTs.compareTo(aTs);
+      return 0;
+    });
+
+    return DoctorOwnerSnapshot(
+      patients: raw.patients,
+      visits: visits,
+      labOrders: raw.labOrders,
+      teamMembers: raw.team,
+    );
+  });
 });
 
-Stream<DoctorOwnerSnapshot> _combine5(
+// ── Raw-combining helper (five streams) ──
+
+class _RawBundle {
+  final List<Map<String, dynamic>> patients;
+  final List<Map<String, dynamic>> appointments;
+  final List<Map<String, dynamic>> consultations;
+  final List<Map<String, dynamic>> labOrders;
+  final List<Map<String, dynamic>> team;
+  _RawBundle({
+    required this.patients,
+    required this.appointments,
+    required this.consultations,
+    required this.labOrders,
+    required this.team,
+  });
+}
+
+Stream<_RawBundle> _combine5(
   Stream<List<Map<String, dynamic>>> a,
   Stream<List<Map<String, dynamic>>> b,
   Stream<List<Map<String, dynamic>>> c,
@@ -295,12 +368,12 @@ Stream<DoctorOwnerSnapshot> _combine5(
   e.listen(ctlE.set, onError: ctlE.error);
 
   return _merge([ctlA, ctlB, ctlC, ctlD, ctlE]).map((_) {
-    return DoctorOwnerSnapshot(
+    return _RawBundle(
       patients: ctlA.value ?? const [],
-      visits: ctlB.value ?? const [],
-      prescriptions: ctlC.value ?? const [],
+      appointments: ctlB.value ?? const [],
+      consultations: ctlC.value ?? const [],
       labOrders: ctlD.value ?? const [],
-      teamMembers: ctlE.value ?? const [],
+      team: ctlE.value ?? const [],
     );
   });
 }
@@ -369,7 +442,7 @@ class DoctorOwnerDashboard extends ConsumerWidget {
               padding: EdgeInsets.zero,
               constraints:
                   const BoxConstraints(minWidth: 36, minHeight: 36),
-              onPressed: () => context.push('/doctor'),
+              onPressed: () => context.go('/doctor'),
             ),
         ],
       ),
@@ -412,10 +485,6 @@ class DoctorOwnerDashboard extends ConsumerWidget {
                     const SizedBox(height: 8),
                     _visitsChart(snap),
                     const SizedBox(height: 24),
-                    const SectionHeader(title: 'Follow-ups due'),
-                    const SizedBox(height: 8),
-                    _followUpsDue(context, snap),
-                    const SizedBox(height: 24),
                     const SectionHeader(title: 'Top diagnoses this month'),
                     const SizedBox(height: 8),
                     _topDiagnoses(snap),
@@ -451,7 +520,7 @@ class DoctorOwnerDashboard extends ConsumerWidget {
     );
   }
 
-  // ── Account (absorbs OwnerShell's Team + Clinic tabs) ──
+  // ── Account ──
   Widget _accountSection(BuildContext context, DoctorOwnerSnapshot snap) {
     int countRole(String role) =>
         snap.teamMembers.where((m) => m['role']?.toString() == role).length;
@@ -462,8 +531,10 @@ class DoctorOwnerDashboard extends ConsumerWidget {
     final total = snap.teamMembers.length;
 
     return Column(
-      children: [
-        GlassCard(
+  children: [
+    const SubscriptionCard(entityType: 'clinic'),
+    const SizedBox(height: 8),
+    GlassCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -651,14 +722,14 @@ class DoctorOwnerDashboard extends ConsumerWidget {
     final q = query.trim().toLowerCase();
     if (q.isEmpty) return;
     final matches = snap.patients.where((p) {
-      final name = (p['name'] ?? '').toString().toLowerCase();
+      final name = (p['fullName'] ?? '').toString().toLowerCase();
       final phone = (p['phone'] ?? '').toString().toLowerCase();
-      final id = (p['patientId'] ?? '').toString().toLowerCase();
-      final pid = (p['publicId'] ?? '').toString().toLowerCase();
+      final pid = (p['patientId'] ?? '').toString().toLowerCase();
+      final did = (p['docId'] ?? '').toString().toLowerCase();
       return name.contains(q) ||
           phone.contains(q) ||
-          id.contains(q) ||
-          pid.contains(q);
+          pid.contains(q) ||
+          did.contains(q);
     }).take(20).toList();
 
     showModalBottomSheet<void>(
@@ -689,9 +760,13 @@ class DoctorOwnerDashboard extends ConsumerWidget {
                         height: 12, color: AppColors.cardBorder),
                     itemBuilder: (_, i) {
                       final p = matches[i];
-                      final pid = (p['patientId'] ?? '').toString();
-                      final name = (p['name'] ?? '').toString();
+                      final docId = (p['docId'] ?? '').toString();
+                      final name = (p['fullName'] ?? '').toString();
                       final phone = (p['phone'] ?? '').toString();
+                      final publicId = (p['patientId'] ?? '').toString();
+                      final subtitle = [phone, publicId]
+                          .where((s) => s.isNotEmpty)
+                          .join(' · ');
                       return ListTile(
                         contentPadding: EdgeInsets.zero,
                         leading: CircleAvatar(
@@ -705,13 +780,13 @@ class DoctorOwnerDashboard extends ConsumerWidget {
                           ),
                         ),
                         title: Text(name, style: AppTextStyles.body),
-                        subtitle:
-                            Text(phone, style: AppTextStyles.caption),
+                        subtitle: Text(subtitle,
+                            style: AppTextStyles.caption),
                         trailing: const Icon(Icons.chevron_right_rounded,
                             color: AppColors.textMuted),
                         onTap: () {
                           Navigator.pop(bctx);
-                          _openPatientRecord(context, snap, pid);
+                          _openPatientRecord(context, snap, docId);
                         },
                       );
                     },
@@ -725,9 +800,9 @@ class DoctorOwnerDashboard extends ConsumerWidget {
   }
 
   void _openPatientRecord(
-      BuildContext context, DoctorOwnerSnapshot snap, String patientId) {
-    final patient = snap.patientById(patientId);
-    final visits = snap.visitsForPatient(patientId);
+      BuildContext context, DoctorOwnerSnapshot snap, String patientDocId) {
+    final patient = snap.patientById(patientDocId);
+    final visits = snap.visitsForPatient(patientDocId);
 
     showModalBottomSheet<void>(
       context: context,
@@ -752,7 +827,8 @@ class DoctorOwnerDashboard extends ConsumerWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        (patient?['name'] ?? 'Unknown patient').toString(),
+                        (patient?['fullName'] ?? 'Unknown patient')
+                            .toString(),
                         style: AppTextStyles.h2,
                       ),
                       const SizedBox(height: 4),
@@ -762,10 +838,10 @@ class DoctorOwnerDashboard extends ConsumerWidget {
                               .toString()
                               .isNotEmpty)
                             patient!['phone'].toString(),
-                          if ((patient?['publicId'] ?? '')
+                          if ((patient?['patientId'] ?? '')
                               .toString()
                               .isNotEmpty)
-                            'ID: ${patient!['publicId']}',
+                            'ID: ${patient!['patientId']}',
                         ].join(' · '),
                         style: AppTextStyles.caption,
                       ),
@@ -779,7 +855,7 @@ class DoctorOwnerDashboard extends ConsumerWidget {
                 ),
               ]),
               const SizedBox(height: 12),
-              _patientSummaryStrip(snap, patientId, visits),
+              _patientSummaryStrip(visits),
               const SizedBox(height: 20),
               const SectionHeader(title: 'Visit history'),
               const SizedBox(height: 8),
@@ -790,7 +866,7 @@ class DoctorOwnerDashboard extends ConsumerWidget {
                 )
               else
                 for (final v in visits) ...[
-                  _visitCard(context, snap, v),
+                  _visitCard(context, v),
                   const SizedBox(height: 10),
                 ],
               const SizedBox(height: 20),
@@ -801,17 +877,11 @@ class DoctorOwnerDashboard extends ConsumerWidget {
     );
   }
 
-  Widget _patientSummaryStrip(DoctorOwnerSnapshot snap, String patientId,
-      List<Map<String, dynamic>> visits) {
+  Widget _patientSummaryStrip(List<Map<String, dynamic>> visits) {
     final lastVisit = visits.isNotEmpty ? visits.first : null;
-    final nextFollowUp = visits
-        .map((v) => v['nextFollowUpAt'])
-        .whereType<Timestamp>()
-        .where((t) => t.toDate().isAfter(DateTime.now()))
-        .fold<Timestamp?>(null, (min, t) {
-      if (min == null) return t;
-      return t.toDate().isBefore(min.toDate()) ? t : min;
-    });
+    final lastTs = lastVisit != null
+        ? DoctorOwnerSnapshot._visitTs(lastVisit)
+        : null;
 
     return GlassCard(
       child: Row(children: [
@@ -822,19 +892,18 @@ class DoctorOwnerDashboard extends ConsumerWidget {
         Expanded(
           child: _metric(
             'Last visit',
-            lastVisit == null
+            lastTs == null
                 ? '—'
-                : DateFormat('d MMM')
-                    .format((lastVisit['visitedAt'] as Timestamp).toDate()),
+                : DateFormat('d MMM').format(lastTs.toDate()),
             AppColors.info,
           ),
         ),
         Expanded(
           child: _metric(
-            'Next follow-up',
-            nextFollowUp == null
+            'Follow-up plan',
+            (lastVisit?['followUpPlan'] ?? '').toString().isEmpty
                 ? '—'
-                : DateFormat('d MMM').format(nextFollowUp.toDate()),
+                : 'View',
             AppColors.warning,
           ),
         ),
@@ -842,24 +911,27 @@ class DoctorOwnerDashboard extends ConsumerWidget {
     );
   }
 
-  Widget _visitCard(BuildContext context, DoctorOwnerSnapshot snap,
-      Map<String, dynamic> visit) {
-    final visitId = (visit['visitId'] ?? '').toString();
-    final when = visit['visitedAt'] is Timestamp
-        ? DateFormat('EEE, d MMM yyyy · h:mm a')
-            .format((visit['visitedAt'] as Timestamp).toDate())
-        : '';
+  Widget _visitCard(
+      BuildContext context, Map<String, dynamic> visit) {
+    final ts = DoctorOwnerSnapshot._visitTs(visit);
+    final when = ts == null
+        ? ''
+        : DateFormat('EEE, d MMM yyyy · h:mm a').format(ts.toDate());
     final diagnosis = (visit['diagnosis'] ?? '').toString();
+    final diagnosisText = (visit['diagnosisText'] ?? '').toString();
+    final diagnosisCode = (visit['diagnosisCode'] ?? '').toString();
     final chiefComplaint = (visit['chiefComplaint'] ?? '').toString();
+    final symptoms = (visit['symptoms'] ?? '').toString();
     final notes = (visit['notes'] ?? '').toString();
-    final fee = (visit['consultationFee'] as num?)?.toDouble() ?? 0;
+    final followUp = (visit['followUpPlan'] ?? '').toString();
+    final fee = (visit['consultationFees'] as num?)?.toDouble() ?? 0;
     final paymentStatus = (visit['paymentStatus'] ?? '').toString();
-    final nextFollowUp = visit['nextFollowUpAt'] is Timestamp
-        ? DateFormat('d MMM yyyy')
-            .format((visit['nextFollowUpAt'] as Timestamp).toDate())
-        : null;
-    final rx = snap.prescriptionsForVisit(visitId);
-    final labs = snap.labOrdersForVisit(visitId);
+    final meds = (visit['medications'] as List?) ?? const [];
+    final labs = (visit['labOrders'] as List?) ?? const [];
+
+    final dxLabel = diagnosisCode.isNotEmpty
+        ? '$diagnosisCode — ${diagnosisText.isNotEmpty ? diagnosisText : diagnosis}'
+        : diagnosis;
 
     return GlassCard(
       child: Column(
@@ -895,32 +967,37 @@ class DoctorOwnerDashboard extends ConsumerWidget {
             const SizedBox(height: 6),
             _kv('Complaint', chiefComplaint),
           ],
-          if (diagnosis.isNotEmpty) ...[
+          if (symptoms.isNotEmpty) ...[
             const SizedBox(height: 4),
-            _kv('Diagnosis', diagnosis),
+            _kv('Symptoms', symptoms),
+          ],
+          if (dxLabel.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            _kv('Diagnosis', dxLabel),
           ],
           if (notes.isNotEmpty) ...[
             const SizedBox(height: 4),
             _kv('Notes', notes),
           ],
-          if (nextFollowUp != null) ...[
+          if (followUp.isNotEmpty) ...[
             const SizedBox(height: 4),
-            _kv('Next follow-up', nextFollowUp),
+            _kv('Follow-up', followUp),
           ],
-          if (rx.isNotEmpty) ...[
+          if (meds.isNotEmpty) ...[
             const SizedBox(height: 10),
-            Text('Prescriptions (${rx.length})',
+            Text('Medications (${meds.length})',
                 style: AppTextStyles.caption.copyWith(
                     fontWeight: FontWeight.w700,
                     color: AppColors.textPrimary)),
             const SizedBox(height: 4),
-            for (final r in rx)
+            for (final m in meds.whereType<Map>())
               Padding(
                 padding: const EdgeInsets.only(bottom: 3),
                 child: Text(
-                  '• ${(r['drugName'] ?? r['name'] ?? '').toString()}'
-                  '${(r['dosage'] ?? '').toString().isNotEmpty ? ' — ${r['dosage']}' : ''}'
-                  '${(r['duration'] ?? '').toString().isNotEmpty ? ' (${r['duration']})' : ''}',
+                  '• ${(m['name'] ?? '').toString()}'
+                  '${(m['dose'] ?? '').toString().isNotEmpty ? ' — ${m['dose']}' : ''}'
+                  '${(m['frequency'] ?? '').toString().isNotEmpty ? ' · ${m['frequency']}' : ''}'
+                  '${(m['duration'] ?? '').toString().isNotEmpty ? ' (${m['duration']})' : ''}',
                   style: AppTextStyles.caption,
                 ),
               ),
@@ -932,7 +1009,7 @@ class DoctorOwnerDashboard extends ConsumerWidget {
                     fontWeight: FontWeight.w700,
                     color: AppColors.textPrimary)),
             const SizedBox(height: 4),
-            for (final o in labs)
+            for (final o in labs.whereType<Map>())
               Padding(
                 padding: const EdgeInsets.only(bottom: 3),
                 child: Text(
@@ -996,10 +1073,10 @@ class DoctorOwnerDashboard extends ConsumerWidget {
         color: AppColors.success,
       ),
       (
-        label: 'Follow-ups due',
-        value: '${snap.followUpsDue.length}',
-        icon: Icons.notifications_active_rounded,
-        color: AppColors.warning,
+        label: 'Total visits',
+        value: '${snap.totalVisits}',
+        icon: Icons.history_rounded,
+        color: AppColors.labAccent,
       ),
     ];
 
@@ -1163,77 +1240,6 @@ class DoctorOwnerDashboard extends ConsumerWidget {
     );
   }
 
-  // ── Follow-ups due ──
-  Widget _followUpsDue(BuildContext context, DoctorOwnerSnapshot snap) {
-    final due = snap.followUpsDue;
-    final overdue = snap.overdueFollowUps;
-    if (due.isEmpty && overdue.isEmpty) {
-      return GlassCard(
-        child: Text('No follow-ups due in the next 7 days.',
-            style: AppTextStyles.bodyMuted),
-      );
-    }
-
-    Widget row(Map<String, dynamic> v, {required bool isOverdue}) {
-      final pid = (v['patientId'] ?? '').toString();
-      final patient = snap.patientById(pid);
-      final name = (patient?['name'] ?? 'Unknown').toString();
-      final ts = v['nextFollowUpAt'] as Timestamp;
-      final when = DateFormat('EEE, d MMM').format(ts.toDate());
-      return Padding(
-        padding: const EdgeInsets.only(bottom: 8),
-        child: Row(children: [
-          Icon(
-            isOverdue ? Icons.warning_amber_rounded : Icons.event_rounded,
-            size: 18,
-            color: isOverdue ? AppColors.error : AppColors.warning,
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(name, style: AppTextStyles.body),
-                Text(when, style: AppTextStyles.caption),
-              ],
-            ),
-          ),
-          IconButton(
-            onPressed: () => _openPatientRecord(context, snap, pid),
-            icon: const Icon(Icons.chevron_right_rounded,
-                color: AppColors.textMuted, size: 18),
-          ),
-        ]),
-      );
-    }
-
-    return GlassCard(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (overdue.isNotEmpty) ...[
-            Text('Overdue',
-                style: AppTextStyles.caption.copyWith(
-                    color: AppColors.error,
-                    fontWeight: FontWeight.w700)),
-            const SizedBox(height: 6),
-            for (final v in overdue.take(5)) row(v, isOverdue: true),
-            if (due.isNotEmpty)
-              const Divider(height: 16, color: AppColors.cardBorder),
-          ],
-          if (due.isNotEmpty) ...[
-            Text('Upcoming',
-                style: AppTextStyles.caption.copyWith(
-                    color: AppColors.warning,
-                    fontWeight: FontWeight.w700)),
-            const SizedBox(height: 6),
-            for (final v in due.take(5)) row(v, isOverdue: false),
-          ],
-        ],
-      ),
-    );
-  }
-
   // ── Top diagnoses ──
   Widget _topDiagnoses(DoctorOwnerSnapshot snap) {
     final list = snap.topDiagnosesThisMonth;
@@ -1349,9 +1355,9 @@ class DoctorOwnerDashboard extends ConsumerWidget {
         _reportTile(
           icon: Icons.medication_outlined,
           color: AppColors.success,
-          title: 'Download prescriptions (CSV)',
-          subtitle: 'All prescriptions with drug, dosage, duration',
-          onTap: () => _exportPrescriptionsCsv(context, snap),
+          title: 'Download medications (CSV)',
+          subtitle: 'All medications across consultations',
+          onTap: () => _exportMedicationsCsv(context, snap),
         ),
         const SizedBox(height: 8),
         _reportTile(
@@ -1411,30 +1417,27 @@ class DoctorOwnerDashboard extends ConsumerWidget {
       BuildContext context, DoctorOwnerSnapshot snap) async {
     final buf = StringBuffer();
     buf.writeln(
-        'VisitID,PatientID,PatientName,VisitedAt,ChiefComplaint,Diagnosis,ConsultationFee,PaymentStatus,Status,NextFollowUp');
+        'VisitID,PatientID,PatientDocID,PatientName,When,ChiefComplaint,Symptoms,DiagnosisCode,DiagnosisText,Notes,FollowUp,ConsultationFee,PaymentStatus,Status');
     for (final v in snap.visits) {
-      final pid = (v['patientId'] ?? '').toString();
-      final patient = snap.patientById(pid);
-      final pname = (patient?['name'] ?? '').toString();
-      final when = v['visitedAt'] is Timestamp
-          ? DateFormat('yyyy-MM-dd HH:mm')
-              .format((v['visitedAt'] as Timestamp).toDate())
-          : '';
-      final next = v['nextFollowUpAt'] is Timestamp
-          ? DateFormat('yyyy-MM-dd')
-              .format((v['nextFollowUpAt'] as Timestamp).toDate())
-          : '';
+      final ts = DoctorOwnerSnapshot._visitTs(v);
+      final when = ts == null
+          ? ''
+          : DateFormat('yyyy-MM-dd HH:mm').format(ts.toDate());
       buf.writeln([
         _csv((v['visitId'] ?? '').toString()),
-        _csv(pid),
-        _csv(pname),
+        _csv((v['patientId'] ?? '').toString()),
+        _csv((v['patientDocId'] ?? '').toString()),
+        _csv((v['patientName'] ?? '').toString()),
         _csv(when),
         _csv((v['chiefComplaint'] ?? '').toString()),
-        _csv((v['diagnosis'] ?? '').toString()),
-        (v['consultationFee'] as num?)?.toStringAsFixed(2) ?? '',
+        _csv((v['symptoms'] ?? '').toString()),
+        _csv((v['diagnosisCode'] ?? '').toString()),
+        _csv((v['diagnosisText'] ?? '').toString()),
+        _csv((v['notes'] ?? '').toString()),
+        _csv((v['followUpPlan'] ?? '').toString()),
+        (v['consultationFees'] as num?)?.toStringAsFixed(2) ?? '',
         _csv((v['paymentStatus'] ?? '').toString()),
         _csv((v['status'] ?? '').toString()),
-        _csv(next),
       ].join(','));
     }
     await _writeAndNotify(context, 'visits', buf.toString());
@@ -1443,21 +1446,22 @@ class DoctorOwnerDashboard extends ConsumerWidget {
   Future<void> _exportPatientsCsv(
       BuildContext context, DoctorOwnerSnapshot snap) async {
     final buf = StringBuffer();
-    buf.writeln('PatientID,PublicID,Name,Phone,Age,Gender,LastVisit');
+    buf.writeln('PatientDocID,PublicID,Name,Phone,Age,Gender,LastVisit');
     for (final p in snap.patients) {
-      final pid = (p['patientId'] ?? '').toString();
-      final visits = snap.visitsForPatient(pid);
-      final lastVisit =
-          visits.isNotEmpty && visits.first['visitedAt'] is Timestamp
-              ? DateFormat('yyyy-MM-dd')
-                  .format((visits.first['visitedAt'] as Timestamp).toDate())
-              : '';
+      final docId = (p['docId'] ?? '').toString();
+      final visits = snap.visitsForPatient(docId);
+      final lastTs = visits.isNotEmpty
+          ? DoctorOwnerSnapshot._visitTs(visits.first)
+          : null;
+      final lastVisit = lastTs == null
+          ? ''
+          : DateFormat('yyyy-MM-dd').format(lastTs.toDate());
       buf.writeln([
-        _csv(pid),
-        _csv((p['publicId'] ?? '').toString()),
-        _csv((p['name'] ?? '').toString()),
+        _csv(docId),
+        _csv((p['patientId'] ?? '').toString()),
+        _csv((p['fullName'] ?? '').toString()),
         _csv((p['phone'] ?? '').toString()),
-        _csv((p['age'] ?? '').toString()),
+        _csv(_ageFromDob(p['dob'])),
         _csv((p['gender'] ?? '').toString()),
         _csv(lastVisit),
       ].join(','));
@@ -1465,24 +1469,39 @@ class DoctorOwnerDashboard extends ConsumerWidget {
     await _writeAndNotify(context, 'patients', buf.toString());
   }
 
-  Future<void> _exportPrescriptionsCsv(
+  Future<void> _exportMedicationsCsv(
       BuildContext context, DoctorOwnerSnapshot snap) async {
     final buf = StringBuffer();
     buf.writeln(
-        'PrescriptionID,VisitID,PatientID,DrugName,Dosage,Frequency,Duration,Notes');
-    for (final r in snap.prescriptions) {
-      buf.writeln([
-        _csv((r['prescriptionId'] ?? '').toString()),
-        _csv((r['visitId'] ?? '').toString()),
-        _csv((r['patientId'] ?? '').toString()),
-        _csv((r['drugName'] ?? r['name'] ?? '').toString()),
-        _csv((r['dosage'] ?? '').toString()),
-        _csv((r['frequency'] ?? '').toString()),
-        _csv((r['duration'] ?? '').toString()),
-        _csv((r['notes'] ?? '').toString()),
-      ].join(','));
+        'VisitID,PatientID,PatientName,DrugName,Dose,Frequency,Duration');
+    for (final v in snap.visits) {
+      final meds = (v['medications'] as List?) ?? const [];
+      if (meds.isEmpty) continue;
+      for (final m in meds.whereType<Map>()) {
+        buf.writeln([
+          _csv((v['visitId'] ?? '').toString()),
+          _csv((v['patientId'] ?? '').toString()),
+          _csv((v['patientName'] ?? '').toString()),
+          _csv((m['name'] ?? '').toString()),
+          _csv((m['dose'] ?? '').toString()),
+          _csv((m['frequency'] ?? '').toString()),
+          _csv((m['duration'] ?? '').toString()),
+        ].join(','));
+      }
     }
-    await _writeAndNotify(context, 'prescriptions', buf.toString());
+    await _writeAndNotify(context, 'medications', buf.toString());
+  }
+
+  String _ageFromDob(dynamic dobRaw) {
+    final dob = DateTime.tryParse(dobRaw?.toString() ?? '');
+    if (dob == null) return '';
+    final now = DateTime.now();
+    var age = now.year - dob.year;
+    if (now.month < dob.month ||
+        (now.month == dob.month && now.day < dob.day)) {
+      age--;
+    }
+    return age.toString();
   }
 
   String _csv(String s) {
@@ -1545,7 +1564,7 @@ class DoctorOwnerDashboard extends ConsumerWidget {
               _previewRow('This week visits', '${snap.thisWeekVisits.length}'),
               _previewRow(
                   'This month visits', '${snap.thisMonthVisits.length}'),
-              _previewRow('Follow-ups due', '${snap.followUpsDue.length}'),
+              _previewRow('Total visits', '${snap.totalVisits}'),
               const Divider(height: 20, color: AppColors.cardBorder),
               Text('Top diagnoses this month',
                   style: AppTextStyles.body

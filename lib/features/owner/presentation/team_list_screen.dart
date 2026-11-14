@@ -1,4 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -9,6 +10,13 @@ import '../../../core/widgets/empty_state.dart';
 import '../../../core/widgets/glass_card.dart';
 import '../../../shared/widgets/clinic_app_bar.dart';
 import '../../staff/presentation/add_staff_screen.dart';
+
+// ═══════════════════════════════════════════════════════════════════
+// PROVIDERS
+// ═══════════════════════════════════════════════════════════════════
+
+/// All staff in the clinic (active + inactive). Patients excluded.
+/// `me.uid` excluded so the current user can't deactivate themselves.
 final teamProvider =
     StreamProvider.autoDispose<List<Map<String, dynamic>>>((ref) async* {
   final me = await ref.watch(currentUserProvider.future);
@@ -21,7 +29,11 @@ final teamProvider =
       .where('clinicId', isEqualTo: me!.clinicId)
       .snapshots()
       .map((s) => s.docs
-          .where((d) => d.id != me.uid)
+          .where((d) {
+            if (d.id == me.uid) return false;
+            final role = (d.data()['role'] ?? '').toString();
+            return role != 'patient';
+          })
           .map((d) {
             final data = d.data();
             return {
@@ -59,6 +71,10 @@ final pendingInvitesProvider =
             };
           }).toList());
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// SCREEN
+// ═══════════════════════════════════════════════════════════════════
 
 class TeamListScreen extends ConsumerWidget {
   const TeamListScreen({super.key});
@@ -104,22 +120,46 @@ class TeamListScreen extends ConsumerWidget {
               error: (e, _) => Text('Error: $e',
                   style: const TextStyle(color: AppColors.error)),
               data: (team) {
-                if (team.isEmpty) {
-                  return const EmptyState(
-                    icon: Icons.people_outline,
-                    title: 'No team members yet',
-                    subtitle:
-                        'Tap "Add Staff" to invite your first receptionist or doctor.',
-                  );
-                }
+                final active =
+                    team.where((m) => (m['active'] ?? true) == true).toList();
+                final inactive =
+                    team.where((m) => (m['active'] ?? true) != true).toList();
+
                 return Column(
-                  children: team
-                      .map((m) => Padding(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    if (active.isEmpty)
+                      const EmptyState(
+                        icon: Icons.people_outline,
+                        title: 'No active team members',
+                        subtitle:
+                            'Tap "Add Staff" to invite your first receptionist or doctor.',
+                      )
+                    else
+                      ...active.map((m) => Padding(
                             padding:
                                 const EdgeInsets.only(bottom: 10),
                             child: _MemberTile(member: m),
-                          ))
-                      .toList(),
+                          )),
+                    if (inactive.isNotEmpty) ...[
+                      const SizedBox(height: 20),
+                      const Padding(
+                        padding: EdgeInsets.only(bottom: 12),
+                        child: Text('INACTIVE STAFF',
+                            style: TextStyle(
+                              color: AppColors.textSecondary,
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                              letterSpacing: 0.8,
+                            )),
+                      ),
+                      ...inactive.map((m) => Padding(
+                            padding:
+                                const EdgeInsets.only(bottom: 10),
+                            child: _MemberTile(member: m),
+                          )),
+                    ],
+                  ],
                 );
               },
             ),
@@ -164,57 +204,184 @@ class TeamListScreen extends ConsumerWidget {
   }
 }
 
-class _MemberTile extends StatelessWidget {
+// ═══════════════════════════════════════════════════════════════════
+// MEMBER TILE (with deactivate / reactivate)
+// ═══════════════════════════════════════════════════════════════════
+
+class _MemberTile extends ConsumerWidget {
   final Map<String, dynamic> member;
   const _MemberTile({required this.member});
 
-  @override
-  Widget build(BuildContext context) {
-    return GlassCard(
-      child: Row(
-        children: [
-          CircleAvatar(
-            backgroundColor: AppColors.secondary.withOpacity(0.2),
-            child: Text(
-              (member['name'] as String).isNotEmpty
-                  ? (member['name'] as String)[0].toUpperCase()
-                  : '?',
-              style: const TextStyle(color: AppColors.secondary),
-            ),
+  bool get _isActive => (member['active'] ?? true) == true;
+
+  Future<void> _setActive({
+    required String uid,
+    required bool active,
+  }) async {
+    await FirebaseFirestore.instance
+        .collection('users')
+        .doc(uid)
+        .update({
+      'active': active,
+      'updatedAt': FieldValue.serverTimestamp(),
+      'updatedByUid': FirebaseAuth.instance.currentUser?.uid,
+    });
+  }
+
+  Future<void> _confirmToggle(BuildContext context) async {
+    final name = (member['name'] ?? 'this staff member').toString();
+    final uid = (member['id'] ?? '').toString();
+    if (uid.isEmpty) return;
+
+    final willDeactivate = _isActive;
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Text(
+            willDeactivate ? 'Deactivate staff?' : 'Reactivate staff?',
+            style: AppTextStyles.h3),
+        content: Text(
+          willDeactivate
+              ? '$name will be signed out and unable to log in until reactivated.'
+              : '$name will be able to log in again.',
+          style: const TextStyle(color: AppColors.textSecondary),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dctx, false),
+            child: const Text('Cancel'),
           ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(member['name'] ?? '', style: AppTextStyles.h3),
-                Text(member['email'] ?? '',
-                    style: AppTextStyles.caption),
-              ],
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor:
+                  willDeactivate ? AppColors.error : AppColors.success,
+              foregroundColor: Colors.white,
             ),
-          ),
-          Container(
-            padding: const EdgeInsets.symmetric(
-                horizontal: 8, vertical: 4),
-            decoration: BoxDecoration(
-              color: AppColors.primary.withOpacity(0.15),
-              borderRadius: BorderRadius.circular(6),
-            ),
-            child: Text(
-              (member['role'] as String).toUpperCase(),
-              style: const TextStyle(
-                color: AppColors.primary,
-                fontSize: 10,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 0.5,
-              ),
-            ),
+            onPressed: () => Navigator.pop(dctx, true),
+            child: Text(willDeactivate ? 'Deactivate' : 'Reactivate'),
           ),
         ],
       ),
     );
+    if (ok != true) return;
+
+    try {
+      await _setActive(uid: uid, active: !willDeactivate);
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(willDeactivate
+            ? '$name deactivated'
+            : '$name reactivated'),
+        backgroundColor: AppColors.success,
+      ));
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Failed: $e'),
+        backgroundColor: AppColors.error,
+      ));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final active = _isActive;
+    final name = (member['name'] ?? '').toString();
+    final role = (member['role'] ?? '').toString();
+
+    return Opacity(
+      opacity: active ? 1.0 : 0.55,
+      child: GlassCard(
+        child: Row(
+          children: [
+            CircleAvatar(
+              backgroundColor: (active ? AppColors.secondary : AppColors.textMuted)
+                  .withOpacity(0.2),
+              child: Text(
+                name.isNotEmpty ? name[0].toUpperCase() : '?',
+                style: TextStyle(
+                  color: active
+                      ? AppColors.secondary
+                      : AppColors.textMuted,
+                ),
+              ),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(children: [
+                    Flexible(
+                      child: Text(name, style: AppTextStyles.h3),
+                    ),
+                    if (!active) ...[
+                      const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: AppColors.textMuted.withOpacity(0.15),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: const Text(
+                          'INACTIVE',
+                          style: TextStyle(
+                            color: AppColors.textMuted,
+                            fontSize: 9,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 0.4,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ]),
+                  Text((member['email'] ?? '').toString(),
+                      style: AppTextStyles.caption),
+                ],
+              ),
+            ),
+            Container(
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: AppColors.primary.withOpacity(0.15),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Text(
+                role.toUpperCase(),
+                style: const TextStyle(
+                  color: AppColors.primary,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.5,
+                ),
+              ),
+            ),
+            const SizedBox(width: 4),
+            IconButton(
+              tooltip: active ? 'Deactivate' : 'Reactivate',
+              icon: Icon(
+                active
+                    ? Icons.person_off_rounded
+                    : Icons.person_add_alt_1_rounded,
+                color: active ? AppColors.error : AppColors.success,
+                size: 20,
+              ),
+              onPressed: () => _confirmToggle(context),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// INVITE TILE (unchanged)
+// ═══════════════════════════════════════════════════════════════════
 
 class _InviteTile extends StatelessWidget {
   final Map<String, dynamic> invite;

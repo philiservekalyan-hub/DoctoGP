@@ -11,6 +11,58 @@ import '../../../app/theme/app_text_styles.dart';
 import '../../../core/models/user_model.dart';
 import '../../../core/widgets/custom_button.dart';
 import '../../../core/widgets/custom_text_field.dart';
+import '../../../consent/consent_page.dart';
+
+const String kCurrentConsentVersion = '1.0';
+
+class _ClinicConsentInfo {
+  final String name;
+  final String address;
+  final String contact;
+  final String grievanceOfficer;
+  final String grievanceEmail;
+  final String grievancePhone;
+
+  const _ClinicConsentInfo({
+    required this.name,
+    required this.address,
+    required this.contact,
+    required this.grievanceOfficer,
+    required this.grievanceEmail,
+    required this.grievancePhone,
+  });
+
+  static const _fallback = _ClinicConsentInfo(
+    name: 'Your Clinic',
+    address: '—',
+    contact: '—',
+    grievanceOfficer: 'Clinic Grievance Officer',
+    grievanceEmail: 'grievance@example.com',
+    grievancePhone: '—',
+  );
+
+  factory _ClinicConsentInfo.fromClinicDoc(
+    Map<String, dynamic> data, {
+    required String clinicId,
+  }) {
+    String s(String key, String fallback) {
+      final v = data[key];
+      if (v is String && v.trim().isNotEmpty) return v.trim();
+      return fallback;
+    }
+
+    return _ClinicConsentInfo(
+      name: s('name', 'Your Clinic'),
+      address: s('address', '—'),
+      contact: s('contact', s('phone', '—')),
+      grievanceOfficer: s('grievanceOfficerName', 'Clinic Grievance Officer'),
+      grievanceEmail: s('grievanceOfficerEmail', 'grievance@example.com'),
+      grievancePhone: s('grievanceOfficerPhone', '—'),
+    );
+  }
+
+  static const fallback = _fallback;
+}
 
 class SignupScreen extends ConsumerStatefulWidget {
   const SignupScreen({super.key});
@@ -25,7 +77,9 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
   final _phone = TextEditingController();
   final _password = TextEditingController();
   final _confirmPassword = TextEditingController();
+  final _dob = TextEditingController();
 
+  DateTime? _dobDate;
   bool _loading = false;
   String? _error;
 
@@ -36,7 +90,38 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
     _phone.dispose();
     _password.dispose();
     _confirmPassword.dispose();
+    _dob.dispose();
     super.dispose();
+  }
+
+  bool get _isMinor {
+    final d = _dobDate;
+    if (d == null) return false;
+    final now = DateTime.now();
+    var age = now.year - d.year;
+    if (now.month < d.month ||
+        (now.month == d.month && now.day < d.day)) {
+      age--;
+    }
+    return age < 18;
+  }
+
+  Future<void> _pickDob() async {
+    final now = DateTime.now();
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: _dobDate ?? DateTime(now.year - 25, now.month, now.day),
+      firstDate: DateTime(now.year - 120),
+      lastDate: now,
+      helpText: 'Select date of birth',
+    );
+    if (picked == null) return;
+    setState(() {
+      _dobDate = picked;
+      _dob.text = '${picked.year.toString().padLeft(4, '0')}-'
+          '${picked.month.toString().padLeft(2, '0')}-'
+          '${picked.day.toString().padLeft(2, '0')}';
+    });
   }
 
   String _normalizePhone(String raw) {
@@ -63,11 +148,89 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
     return '${e.substring(0, 2)}***@${e.substring(at + 1)}';
   }
 
+  // ===========================================================================
+  // CONSENT — stored on the patient / lab-customer doc, not users/{uid}
+  // ===========================================================================
+
+  Future<ConsentRecord?> _collectConsent({
+    required _ClinicConsentInfo clinicInfo,
+    required String patientCollection,
+    required String patientDocId,
+  }) async {
+    if (!mounted) return null;
+
+    return Navigator.of(context).push<ConsentRecord>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => ConsentPage(
+          clinicName: clinicInfo.name,
+          clinicAddress: clinicInfo.address,
+          clinicContact: clinicInfo.contact,
+          grievanceOfficer: clinicInfo.grievanceOfficer,
+          grievanceEmail: clinicInfo.grievanceEmail,
+          grievancePhone: clinicInfo.grievancePhone,
+          noticeVersion: kCurrentConsentVersion,
+          requireScrollToEnd: true,
+          isMinor: _isMinor,
+          dateOfBirth: _dob.text.isEmpty ? null : _dob.text,
+          onConsentGiven: (record) => _saveConsentToPatient(
+            patientCollection: patientCollection,
+            patientDocId: patientDocId,
+            record: record,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _saveConsentToPatient({
+    required String patientCollection,
+    required String patientDocId,
+    required ConsentRecord record,
+  }) async {
+    await FirebaseAuth.instance.currentUser?.getIdToken(true);
+
+    final db = FirebaseFirestore.instance;
+    final docRef = db.collection(patientCollection).doc(patientDocId);
+    final auditRef = docRef.collection('consent_records').doc();
+
+    final batch = db.batch();
+
+    batch.update(docRef, {
+      'consent_status': true,
+      'consent_version': record.noticeVersion,
+      'consent_accepted_purposes': record.acceptedPurposes,
+      'consent_updated_at': FieldValue.serverTimestamp(),
+      'is_minor': record.isMinorConsent,
+      if (record.guardianName != null)
+        'guardian_name': record.guardianName,
+      if (record.guardianRelationship != null)
+        'guardian_relationship': record.guardianRelationship,
+      
+    });
+
+    batch.set(auditRef, {
+      ...record.toMap(),
+      'timestamp': FieldValue.serverTimestamp(),
+      'platform': defaultTargetPlatform.name,
+    });
+
+    await batch.commit();
+  }
+
+  // ===========================================================================
+  // SIGN-UP FLOW
+  // ===========================================================================
+
   Future<void> _signUp() async {
     if (_name.text.trim().isEmpty ||
         _email.text.trim().isEmpty ||
         _phone.text.trim().isEmpty) {
       setState(() => _error = 'Please fill all fields');
+      return;
+    }
+    if (_dobDate == null) {
+      setState(() => _error = 'Please enter the patient\'s date of birth');
       return;
     }
     if (_password.text.length < 6) {
@@ -89,7 +252,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
     final db = FirebaseFirestore.instance;
 
     // -----------------------------------------------------------------
-    // Step 1 — Create the Firebase Auth account
+    // Step 1 — Auth account
     // -----------------------------------------------------------------
     UserCredential? cred;
     try {
@@ -118,19 +281,14 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
     }
 
     final uid = cred.user!.uid;
+    // Force a fresh token before the first Firestore write.
+    await cred.user!.getIdToken(true);
 
     // -----------------------------------------------------------------
     // Step 2 — Role resolution
-    //   2a. Owner
-    //   2b. Invite
-    //   2c. Clinic patient (patients collection)
-    //   2d. Lab customer (labCustomers collection) — with confirmation
-    //   2e. No match → rollback + reject
     // -----------------------------------------------------------------
     try {
-      // -------------------------------------------------------------
       // 2a. Owner
-      // -------------------------------------------------------------
       final ownerSnap = await db
           .collection('clinics')
           .where('ownerEmail', isEqualTo: normalizedEmail)
@@ -151,6 +309,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
           'name': _name.text.trim(),
           'email': normalizedEmail,
           'phone': normalizedPhone,
+          'dateOfBirth': _dob.text,
           'role': 'owner',
           'clinicId': clinicId,
           'clinicCode': clinicData['clinicCode'],
@@ -171,9 +330,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
         return;
       }
 
-      // -------------------------------------------------------------
       // 2b. Invite
-      // -------------------------------------------------------------
       final inviteSnap = await db
           .collection('invites')
           .where('email', isEqualTo: normalizedEmail)
@@ -209,6 +366,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
           'phone': normalizedPhone.isNotEmpty
               ? normalizedPhone
               : (invite['phone'] ?? ''),
+          'dateOfBirth': _dob.text,
           'role': role,
           'clinicId': clinicId,
           'clinicCode': clinicCode,
@@ -236,9 +394,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
         return;
       }
 
-      // -------------------------------------------------------------
-      // 2c. Clinic patient
-      // -------------------------------------------------------------
+      // 2c. Clinic patient → CONSENT GATE
       final patientSnap = await db
           .collection('patients')
           .where('email', isEqualTo: normalizedEmail)
@@ -252,6 +408,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
 
         String? clinicCode;
         String? clinicName;
+        _ClinicConsentInfo clinicInfo = _ClinicConsentInfo.fallback;
         if (clinicId != null) {
           final clinicDoc =
               await db.collection('clinics').doc(clinicId).get();
@@ -259,13 +416,20 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
             final cData = clinicDoc.data() ?? {};
             clinicCode = cData['clinicCode'] as String?;
             clinicName = cData['name'] as String?;
+            clinicInfo = _ClinicConsentInfo.fromClinicDoc(
+              cData,
+              clinicId: clinicId,
+            );
           }
         }
 
+        // 1) users/{uid} — auth link only
         await db.collection('users').doc(uid).set({
           'name': patientData['fullName'] ?? _name.text.trim(),
           'email': normalizedEmail,
           'phone': patientData['phone'] ?? normalizedPhone,
+          'dateOfBirth': _dob.text,
+          'isMinor': _isMinor,
           'role': 'patient',
           'clinicId': clinicId,
           'clinicCode': clinicCode,
@@ -278,19 +442,37 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
           'updatedByUid': uid,
         });
 
+        // 2) patients/{id} — link userId BEFORE consent so the rule
+        //    branch `resource.data.userId == uid()` fires for the consent write
         await patientDoc.reference.update({
           'userId': uid,
           'appRegisteredAt': FieldValue.serverTimestamp(),
+          'dateOfBirth': _dob.text,
         });
+
+        // 3) Consent gate — writes to patients/{id} + subcollection
+        final consent = await _collectConsent(
+          clinicInfo: clinicInfo,
+          patientCollection: 'patients',
+          patientDocId: patientDoc.id,
+        );
+        if (consent == null) {
+          await _rollbackAuth(cred);
+          if (!mounted) return;
+          setState(() {
+            _loading = false;
+            _error = 'You must give consent to create your account. '
+                'You can try again when you are ready.';
+          });
+          return;
+        }
 
         if (!mounted) return;
         context.go('/patient');
         return;
       }
 
-      // -------------------------------------------------------------
-      // 2d. Lab customer — either-match lookup, then confirmation.
-      // -------------------------------------------------------------
+      // 2d. Lab customer → CONSENT GATE
       var labCustomerSnap = await db
           .collection('labCustomers')
           .where('phone', isEqualTo: normalizedPhone)
@@ -314,11 +496,17 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
         final labClinicId = (data['labClinicId'] ?? '').toString();
 
         String? labName;
+        _ClinicConsentInfo labInfo = _ClinicConsentInfo.fallback;
         if (labClinicId.isNotEmpty) {
           final labDoc =
               await db.collection('clinics').doc(labClinicId).get();
           if (labDoc.exists) {
-            labName = labDoc.data()?['name'] as String?;
+            final lData = labDoc.data() ?? {};
+            labName = lData['name'] as String?;
+            labInfo = _ClinicConsentInfo.fromClinicDoc(
+              lData,
+              clinicId: labClinicId,
+            );
           }
         }
 
@@ -352,10 +540,13 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
           }
         }
 
+        // 1) users/{uid} — auth link only
         await db.collection('users').doc(uid).set({
           'name': matchedName.isEmpty ? _name.text.trim() : matchedName,
           'email': normalizedEmail,
           'phone': matchedPhone.isEmpty ? normalizedPhone : matchedPhone,
+          'dateOfBirth': _dob.text,
+          'isMinor': _isMinor,
           'role': 'patient',
           'clinicId': labClinicId.isEmpty ? null : labClinicId,
           'clinicCode': labCode,
@@ -369,23 +560,39 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
           'updatedByUid': uid,
         });
 
-        final batch = db.batch();
+        // 2) labCustomers/{id} — link BEFORE consent
+        final linkBatch = db.batch();
         for (final doc in labCustomerSnap.docs) {
-          batch.update(doc.reference, {
+          linkBatch.update(doc.reference, {
             'linkedUserUid': uid,
             'linkedAt': FieldValue.serverTimestamp(),
           });
         }
-        await batch.commit();
+        await linkBatch.commit();
+
+        // 3) Consent gate — writes to labCustomers/{id} + subcollection
+        final consent = await _collectConsent(
+          clinicInfo: labInfo,
+          patientCollection: 'labCustomers',
+          patientDocId: matched.id,
+        );
+        if (consent == null) {
+          await _rollbackAuth(cred);
+          if (!mounted) return;
+          setState(() {
+            _loading = false;
+            _error = 'You must give consent to create your account. '
+                'You can try again when you are ready.';
+          });
+          return;
+        }
 
         if (!mounted) return;
         context.go('/patient');
         return;
       }
 
-      // -------------------------------------------------------------
       // 2e. No match
-      // -------------------------------------------------------------
       await _rollbackAuth(cred);
 
       if (!mounted) return;
@@ -596,6 +803,8 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final minorHint = _isMinor;
+
     return Scaffold(
       body: Container(
         decoration: const BoxDecoration(gradient: AppColors.bgGradient),
@@ -626,7 +835,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
 
                 CustomTextField(
                   controller: _name,
-                  label: 'Full Name',
+                  label: minorHint ? 'Patient (child) name' : 'Full Name',
                   hint: 'e.g. Anita Rao',
                   icon: Icons.person_outline_rounded,
                 ),
@@ -647,6 +856,57 @@ class _SignupScreenState extends ConsumerState<SignupScreen> {
                   keyboardType: TextInputType.phone,
                 ),
                 const SizedBox(height: 20),
+
+                InkWell(
+                  onTap: _pickDob,
+                  borderRadius: BorderRadius.circular(12),
+                  child: InputDecorator(
+                    decoration: InputDecoration(
+                      labelText: minorHint
+                          ? 'Date of Birth (required for guardian consent)'
+                          : 'Date of Birth',
+                      border: const OutlineInputBorder(),
+                      prefixIcon: const Icon(Icons.cake_outlined),
+                    ),
+                    child: Text(
+                      _dobDate == null ? 'Select date' : _dob.text,
+                      style: TextStyle(
+                        fontSize: 15,
+                        color: _dobDate == null
+                            ? AppColors.textMuted
+                            : AppColors.textPrimary,
+                      ),
+                    ),
+                  ),
+                ),
+                if (minorHint) ...[
+                  const SizedBox(height: 8),
+                  Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: AppColors.info.withOpacity(0.10),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                          color: AppColors.info.withOpacity(0.35)),
+                    ),
+                    child: Row(children: [
+                      const Icon(Icons.family_restroom,
+                          color: AppColors.info, size: 18),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'This patient is under 18. A parent or lawful '
+                          'guardian will need to give consent on the next '
+                          'screen.',
+                          style: AppTextStyles.caption
+                              .copyWith(color: AppColors.info),
+                        ),
+                      ),
+                    ]),
+                  ),
+                ],
+                const SizedBox(height: 20),
+
                 CustomTextField(
                   controller: _password,
                   label: 'Password',

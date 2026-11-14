@@ -7,6 +7,7 @@ import '../services/consultation_service.dart';
 import '../services/lab_service.dart';
 import '../services/patient_history_service.dart';
 import '../services/patient_service.dart';
+import '../services/chemist_service.dart';
 
 final appointmentServiceProvider =
     Provider<AppointmentService>((ref) => AppointmentService());
@@ -23,6 +24,8 @@ final labServiceProvider =
 final consultationServiceProvider =
     Provider<ConsultationService>((ref) => ConsultationService());
 
+final chemistServiceProvider =
+    Provider<ChemistService>((ref) => ChemistService());
 
 final patientHistoryServiceProvider = Provider<PatientHistoryService>((ref) {
   return PatientHistoryService(

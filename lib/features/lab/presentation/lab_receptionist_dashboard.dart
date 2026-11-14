@@ -10,11 +10,14 @@ import '../../../app/router.dart';
 import '../../../app/theme/app_colors.dart';
 import '../../../app/theme/app_text_styles.dart';
 import '../../../core/models/lab_order_model.dart';
+import '../../../core/models/subscription_access.dart';
 import '../../../core/providers/service_providers.dart';
+import '../../../core/providers/subscription_providers.dart';
 import '../../../core/widgets/empty_state.dart';
 import '../../../core/widgets/glass_card.dart';
 import '../../../core/widgets/section_header.dart';
 import '../../../shared/widgets/role_badge.dart';
+import '../../subscription/widgets/subscription_banner.dart';
 import 'lab_order_detail_screen.dart';
 import 'lab_walkin_order_screen.dart';
 import 'sample_label_preview.dart';
@@ -75,6 +78,7 @@ class _LabReceptionistDashboardState
   @override
   Widget build(BuildContext context) {
     final userAsync = ref.watch(currentUserProvider);
+    final labClinicId = userAsync.valueOrNull?.clinicId ?? '';
 
     return Scaffold(
       backgroundColor: AppColors.background,
@@ -83,12 +87,39 @@ class _LabReceptionistDashboardState
         elevation: 0,
         title: Text('Lab reception', style: AppTextStyles.h3),
         actions: [
-          IconButton(
-            tooltip: 'New walk-in order',
-            onPressed: () => _openNewWalkin(context),
-            icon: const Icon(Icons.add_circle_outline_rounded,
-                color: AppColors.labAccent),
-          ),
+          // ── Gated "New walk-in order" ──
+          Consumer(builder: (context, ref, _) {
+            if (labClinicId.isEmpty) {
+              return IconButton(
+                tooltip: 'New walk-in order',
+                onPressed: () => _openNewWalkin(context),
+                icon: const Icon(Icons.add_circle_outline_rounded,
+                    color: AppColors.labAccent),
+              );
+            }
+            final access = ref.watch(subscriptionAccessProvider(
+              (entityType: 'lab',
+                  entityId: labClinicId,
+                  planType: 'lab_monthly'),
+            ));
+            final blocked = !access.allows(
+              SubscriptionFeature.newPatientRegistration,
+            );
+            return IconButton(
+              tooltip: blocked
+                  ? 'Renew subscription to create new orders'
+                  : 'New walk-in order',
+              onPressed: () => _openNewWalkin(context),
+              icon: Icon(
+                blocked
+                    ? Icons.lock_outline_rounded
+                    : Icons.add_circle_outline_rounded,
+                color: blocked
+                    ? AppColors.warning
+                    : AppColors.labAccent,
+              ),
+            );
+          }),
           IconButton(
             tooltip: 'Refresh',
             onPressed: () => ref.invalidate(labReceptionOrdersProvider),
@@ -131,6 +162,13 @@ class _LabReceptionistDashboardState
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    // ── Subscription banner ──
+                    SubscriptionBanner(
+                      entityType: 'lab',
+                      entityId: labClinicId,
+                      planType: 'lab_monthly',
+                      onRenew: () => _openCheckout(context, labClinicId),
+                    ),
                     _header(context, user?.name ?? 'Lab reception'),
                     const SizedBox(height: 20),
                     _searchBar(context),
@@ -154,6 +192,133 @@ class _LabReceptionistDashboardState
     );
   }
 
+  // -------------------------------------------------------------
+  // Subscription helpers
+  // -------------------------------------------------------------
+
+  void _openCheckout(BuildContext context, String labClinicId) {
+    context.push(
+      '/subscription/checkout'
+      '?entityType=lab&entityId=$labClinicId&planType=lab_monthly',
+    );
+  }
+
+  Future<void> _openNewWalkin(BuildContext context) async {
+    final user = ref.read(currentUserProvider).valueOrNull;
+    final labClinicId = user?.clinicId ?? '';
+
+    if (labClinicId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No lab linked to your account.'),
+          backgroundColor: AppColors.error,
+        ),
+      );
+      return;
+    }
+
+    // ── Gate: block if subscription doesn't allow new orders ──
+    final access = ref.read(subscriptionAccessProvider(
+      (entityType: 'lab', entityId: labClinicId, planType: 'lab_monthly'),
+    ));
+    if (!access.allows(SubscriptionFeature.newPatientRegistration)) {
+      await _showNewOrderUpgradeDialog(context, labClinicId);
+      return;
+    }
+
+    final created = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => const LabWalkinOrderScreen(),
+      ),
+    );
+    if (created == true) {
+      ref.invalidate(labReceptionOrdersProvider);
+    }
+  }
+
+  Future<void> _showNewOrderUpgradeDialog(
+      BuildContext context, String labClinicId) async {
+    // Read the caller's role so we can tailor the message.
+    final userSnap = await FirebaseFirestore.instance
+        .collection('users')
+        .doc(FirebaseAuth.instance.currentUser?.uid ?? '')
+        .get();
+    final role = (userSnap.data()?['role'] ?? '').toString();
+    final isOwner = role == 'owner';
+    final isAdmin = role == 'admin';
+    final canSelfRenew = isOwner || isAdmin;
+
+    if (!context.mounted) return;
+
+    final renew = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Row(children: [
+          const Icon(Icons.lock_outline_rounded,
+              color: AppColors.warning),
+          const SizedBox(width: 10),
+          Expanded(
+            child:
+                Text('Subscription inactive', style: AppTextStyles.h3),
+          ),
+        ]),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Creating new walk-in lab orders requires an active '
+              'subscription.',
+              style: AppTextStyles.body,
+            ),
+            const SizedBox(height: 10),
+            Text(
+              'Your existing orders remain fully accessible — you can '
+              'process samples, release reports, collect fees, and search '
+              'any patient.',
+              style: AppTextStyles.bodyMuted,
+            ),
+            const SizedBox(height: 10),
+            if (canSelfRenew)
+              Text(
+                'Renew to resume new order creation, analytics, and bulk '
+                'exports.',
+                style: AppTextStyles.caption
+                    .copyWith(color: AppColors.info),
+              )
+            else
+              Text(
+                'Please ask the lab owner to renew the subscription from '
+                'their dashboard. Only the owner can complete the payment.',
+                style: AppTextStyles.caption
+                    .copyWith(color: AppColors.info),
+              ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Not now'),
+          ),
+          if (canSelfRenew)
+            ElevatedButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Renew now'),
+            ),
+        ],
+      ),
+    );
+
+    if (renew == true && context.mounted) {
+      _openCheckout(context, labClinicId);
+    }
+  }
+
+  // -------------------------------------------------------------
+  // Header, search, etc. (unchanged)
+  // -------------------------------------------------------------
+
   Widget _header(BuildContext context, String name) {
     return Row(children: [
       Expanded(
@@ -176,7 +341,8 @@ class _LabReceptionistDashboardState
       controller: _searchCtrl,
       textInputAction: TextInputAction.search,
       decoration: InputDecoration(
-        hintText: 'Search lab order by patient name, phone, or ID',
+        hintText:
+            'Search by name, phone, patient ID, or booking ID',
         prefixIcon: const Icon(Icons.search_rounded),
         suffixIcon: IconButton(
           icon: const Icon(Icons.arrow_forward_rounded),
@@ -198,17 +364,6 @@ class _LabReceptionistDashboardState
         builder: (_) => _LabOrderSearchResults(query: q),
       ),
     );
-  }
-
-  Future<void> _openNewWalkin(BuildContext context) async {
-    final created = await Navigator.of(context).push<bool>(
-      MaterialPageRoute(
-        builder: (_) => const LabWalkinOrderScreen(),
-      ),
-    );
-    if (created == true) {
-      ref.invalidate(labReceptionOrdersProvider);
-    }
   }
 
   Widget _needsAttention(
@@ -533,43 +688,45 @@ class _LabReceptionistDashboardState
             style: const TextStyle(color: AppColors.error)),
       ),
       data: (_) {
-  final all = ordersAsync.valueOrNull ?? const <LabOrderModel>[];
-  // Only the "Delivered" section respects the date filter.
-  final delivered = _dayFilter == null
-      ? all.where((o) => o.status == LabOrderStatus.delivered).toList()
-      : ref.watch(labReceptionOrdersForDayProvider(_dayFilter))
-          .where((o) => o.status == LabOrderStatus.delivered)
-          .toList();
+        final all = ordersAsync.valueOrNull ?? const <LabOrderModel>[];
+        final delivered = _dayFilter == null
+            ? all.where((o) => o.status == LabOrderStatus.delivered).toList()
+            : ref.watch(labReceptionOrdersForDayProvider(_dayFilter))
+                .where((o) => o.status == LabOrderStatus.delivered)
+                .toList();
 
-  final awaitingRelease =
-      all.where((o) => o.awaitingRelease).toList();
-  final readyReleased = all
-      .where((o) => o.status == LabOrderStatus.ready && o.released)
-      .toList();
+        final awaitingRelease =
+            all.where((o) => o.awaitingRelease).toList();
+        final readyReleased = all
+            .where((o) => o.status == LabOrderStatus.ready && o.released)
+            .toList();
 
-  return Column(
-    crossAxisAlignment: CrossAxisAlignment.start,
-    children: [
-      _stageSection(context, title: 'New (awaiting acceptance)',
-          statuses: [LabOrderStatus.ordered], orders: all),
-      const SizedBox(height: 20),
-      _stageSection(context, title: 'Awaiting sample',
-          statuses: [LabOrderStatus.accepted], orders: all),
-      const SizedBox(height: 20),
-      _stageSection(context, title: 'In progress',
-          statuses: [LabOrderStatus.sampleCollected, LabOrderStatus.processing],
-          orders: all),
-      const SizedBox(height: 20),
-      _customStageSection(context, title: 'Reports awaiting release',
-          orders: awaitingRelease),
-      const SizedBox(height: 20),
-      _customStageSection(context, title: 'Ready for pickup',
-          orders: readyReleased),
-      const SizedBox(height: 20),
-      _customStageSection(context, title: 'Delivered', orders: delivered),
-    ],
-  );
-},
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _stageSection(context, title: 'New (awaiting acceptance)',
+                statuses: [LabOrderStatus.ordered], orders: all),
+            const SizedBox(height: 20),
+            _stageSection(context, title: 'Awaiting sample',
+                statuses: [LabOrderStatus.accepted], orders: all),
+            const SizedBox(height: 20),
+            _stageSection(context, title: 'In progress',
+                statuses: [
+                  LabOrderStatus.sampleCollected,
+                  LabOrderStatus.processing
+                ],
+                orders: all),
+            const SizedBox(height: 20),
+            _customStageSection(context, title: 'Reports awaiting release',
+                orders: awaitingRelease),
+            const SizedBox(height: 20),
+            _customStageSection(context, title: 'Ready for pickup',
+                orders: readyReleased),
+            const SizedBox(height: 20),
+            _customStageSection(context, title: 'Delivered', orders: delivered),
+          ],
+        );
+      },
     );
   }
 
@@ -679,7 +836,7 @@ class _LabReceptionistDashboardState
 }
 
 // -----------------------------------------------------------------
-// Supporting widgets
+// Supporting widgets (unchanged from your current file)
 // -----------------------------------------------------------------
 class _GlanceTile {
   final String label;
@@ -749,9 +906,11 @@ class _LabOrderRow extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final action = _receptionistAction;
-    final referralLabel = order.isWalkIn
-        ? 'Walk-in'
-        : 'Dr. ${order.doctorName ?? '—'}';
+    final referralLabel = order.source == 'ad_booking'
+        ? 'STAT sponsored ad'
+        : (order.isWalkIn
+            ? 'Walk-in'
+            : 'Dr. ${order.doctorName ?? '—'}');
 
     return GlassCard(
       borderColor: _statusColor.withOpacity(0.4),
@@ -835,23 +994,52 @@ class _LabOrderRow extends ConsumerWidget {
                             ),
                           ),
                           const SizedBox(height: 2),
-                          Row(
+                          Wrap(
+                            crossAxisAlignment: WrapCrossAlignment.center,
+                            spacing: 4,
+                            runSpacing: 2,
                             children: [
-                              Flexible(
-                                child: Text(
-                                  referralLabel,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: AppTextStyles.caption,
+                              if (order.source == 'ad_booking')
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 5, vertical: 1),
+                                  decoration: BoxDecoration(
+                                    color: AppColors.info.withOpacity(.15),
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  child: const Text(
+                                    'via STAT',
+                                    style: TextStyle(
+                                      color: AppColors.info,
+                                      fontSize: 9,
+                                      fontWeight: FontWeight.w700,
+                                      letterSpacing: .3,
+                                    ),
+                                  ),
                                 ),
+                              Text(
+                                referralLabel,
+                                style: AppTextStyles.caption,
                               ),
                               if (order.orderedAt != null) ...[
-                                Text('  ·  ',
+                                Text('·',
                                     style: AppTextStyles.caption),
                                 Text(
                                   DateFormat('dd MMM • hh:mm a')
                                       .format(order.orderedAt!),
                                   style: AppTextStyles.caption,
+                                ),
+                              ],
+                              if ((order.bookingRef ?? '').isNotEmpty) ...[
+                                Text('·',
+                                    style: AppTextStyles.caption),
+                                Text(
+                                  order.bookingRef!,
+                                  style: AppTextStyles.caption.copyWith(
+                                    fontFamily: 'monospace',
+                                    color: AppColors.info,
+                                    fontWeight: FontWeight.w600,
+                                  ),
                                 ),
                               ],
                             ],
@@ -1224,7 +1412,7 @@ class _LabOrderRow extends ConsumerWidget {
     }
   }
 
-    Widget _menu(BuildContext context, WidgetRef ref) {
+  Widget _menu(BuildContext context, WidgetRef ref) {
     return PopupMenuButton<String>(
       icon: const Icon(Icons.more_vert_rounded,
           color: AppColors.textMuted, size: 18),
@@ -1327,13 +1515,11 @@ class _LabOrderRow extends ConsumerWidget {
     }
   }
 
- Future<void> _advance(
+  Future<void> _advance(
     BuildContext context,
     WidgetRef ref,
     ({String label, LabOrderStatus next}) action,
   ) async {
-    // Capture navigator context BEFORE awaiting, so it survives the
-    // post-write rebuild that disposes this row widget.
     final navContext = Navigator.of(context, rootNavigator: true).context;
     final scaffoldMessenger = ScaffoldMessenger.of(context);
 
@@ -1351,8 +1537,6 @@ class _LabOrderRow extends ConsumerWidget {
       onChanged();
 
       if (action.next == LabOrderStatus.sampleCollected) {
-        // Small delay so the stream-rebuild disposes this row first;
-        // then we open the sheet on the (still-mounted) navigator.
         await Future.delayed(const Duration(milliseconds: 300));
         if (!navContext.mounted) return;
         await _maybePrintSampleLabel(navContext, ref);
@@ -1365,10 +1549,8 @@ class _LabOrderRow extends ConsumerWidget {
     }
   }
 
-  /// Reads the fresh order doc to pick up sampleGroups assigned by
-  /// updateStatus, then opens the multi-label print preview.
   Future<void> _maybePrintSampleLabel(
-    BuildContext context, // ← this is now the navigator's context
+    BuildContext context,
     WidgetRef ref,
   ) async {
     final updated = await FirebaseFirestore.instance
@@ -1528,9 +1710,11 @@ class _LabOrderSearchResults extends ConsumerWidget {
               final name = o.patientName.toLowerCase();
               final pid = o.patientId.toLowerCase();
               final phone = (o.patientPhone ?? '').toLowerCase();
+              final ref = (o.bookingRef ?? '').toLowerCase();
               return name.contains(q) ||
                   pid.contains(q) ||
-                  phone.contains(q);
+                  phone.contains(q) ||
+                  ref.contains(q);
             }).toList()
               ..sort((a, b) {
                 final at = a.orderedAt ??

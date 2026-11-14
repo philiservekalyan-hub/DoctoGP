@@ -11,6 +11,8 @@ import '../../../core/widgets/section_header.dart';
 import '../../../core/widgets/stat_card.dart';
 import '../../../shared/widgets/clinic_app_bar.dart';
 import 'canonical_tests_screen.dart';
+import 'chemists_admin_screen.dart';
+import 'ads_admin_screen.dart';
 
 class AdminDashboard extends ConsumerWidget {
   const AdminDashboard({super.key});
@@ -19,6 +21,7 @@ class AdminDashboard extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final userAsync = ref.watch(currentUserProvider);
     final clinicsAsync = ref.watch(allClinicsProvider);
+    final chemistsAsync = ref.watch(allChemistsProvider);
 
     return Scaffold(
       backgroundColor: AppColors.background,
@@ -32,7 +35,10 @@ class AdminDashboard extends ConsumerWidget {
                   style: const TextStyle(color: AppColors.error))),
           data: (user) => RefreshIndicator(
             color: AppColors.primary,
-            onRefresh: () async => ref.invalidate(allClinicsProvider),
+            onRefresh: () async {
+              ref.invalidate(allClinicsProvider);
+              ref.invalidate(allChemistsProvider);
+            },
             child: SingleChildScrollView(
               physics: const AlwaysScrollableScrollPhysics(),
               padding: const EdgeInsets.all(20),
@@ -40,11 +46,11 @@ class AdminDashboard extends ConsumerWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Welcome, ${user?.name.split(" ").first ?? "Admin"}',
-                    style: AppTextStyles.h1,
-                  ),
+  'Welcome, STAT Admin',
+  style: AppTextStyles.h2,
+),
                   const SizedBox(height: 4),
-                  Text('Manage clinics and labs on the platform',
+                  Text('Manage clinics, labs, and chemists on the platform',
                       style: AppTextStyles.bodyMuted),
                   const SizedBox(height: 24),
 
@@ -113,6 +119,53 @@ class AdminDashboard extends ConsumerWidget {
                     },
                   ),
 
+                  const SizedBox(height: 24),
+                  chemistsAsync.when(
+                    loading: () => const SizedBox.shrink(),
+                    error: (_, __) => const SizedBox.shrink(),
+                    data: (chemists) {
+                      final active = chemists.where((c) => c.isActive).length;
+                      final inactive = chemists.length - active;
+                      final delivering =
+                          chemists.where((c) => c.deliveryAvailable).length;
+
+                      return Row(children: [
+                        Expanded(
+                          child: StatCard(
+                            label: 'Chemists',
+                            value: chemists.length
+                                .toString()
+                                .padLeft(2, '0'),
+                            icon: Icons.local_pharmacy_rounded,
+                            accent: AppColors.patientAccent,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: StatCard(
+                            label: 'Delivering',
+                            value: delivering
+                                .toString()
+                                .padLeft(2, '0'),
+                            icon: Icons.delivery_dining_rounded,
+                            accent: AppColors.info,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: StatCard(
+                            label: 'Inactive',
+                            value: inactive
+                                .toString()
+                                .padLeft(2, '0'),
+                            icon: Icons.pause_circle_rounded,
+                            accent: AppColors.warning,
+                          ),
+                        ),
+                      ]);
+                    },
+                  ),
+
                   const SizedBox(height: 28),
                   const SectionHeader(title: 'Manage'),
                   GlassCard(
@@ -158,6 +211,93 @@ class AdminDashboard extends ConsumerWidget {
                     ),
                   ),
 
+                  const SizedBox(height: 10),
+                  GlassCard(
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(14),
+                      onTap: () => Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => const ChemistsAdminScreen(),
+                        ),
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.all(4),
+                        child: Row(children: [
+                          Container(
+                            padding: const EdgeInsets.all(10),
+                            decoration: BoxDecoration(
+                              color:
+                                  AppColors.patientAccent.withOpacity(.15),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: const Icon(
+                                Icons.local_pharmacy_rounded,
+                                color: AppColors.patientAccent,
+                                size: 20),
+                          ),
+                          const SizedBox(width: 14),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment:
+                                  CrossAxisAlignment.start,
+                              children: [
+                                Text('Chemists',
+                                    style: AppTextStyles.body),
+                                const SizedBox(height: 2),
+                                Text(
+                                  'Add vetted pharmacies, set UPI, '
+                                  'delivery range, and serviceable pincodes',
+                                  style: AppTextStyles.caption,
+                                ),
+                              ],
+                            ),
+                          ),
+                          const Icon(Icons.chevron_right_rounded,
+                              color: AppColors.textMuted),
+                        ]),
+                      ),
+                    ),
+                  ),
+
+const SizedBox(height: 10),
+GlassCard(
+  child: InkWell(
+    borderRadius: BorderRadius.circular(14),
+    onTap: () => Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const AdsAdminScreen()),
+    ),
+    child: Padding(
+      padding: const EdgeInsets.all(4),
+      child: Row(children: [
+        Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            color: AppColors.info.withOpacity(.15),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: const Icon(Icons.campaign_rounded,
+              color: AppColors.info, size: 20),
+        ),
+        const SizedBox(width: 14),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Sponsored offers', style: AppTextStyles.body),
+              const SizedBox(height: 2),
+              Text(
+                'Upload PNG creatives, schedule patient-dashboard ads, approve submissions',
+                style: AppTextStyles.caption,
+              ),
+            ],
+          ),
+        ),
+        const Icon(Icons.chevron_right_rounded, color: AppColors.textMuted),
+      ]),
+    ),
+  ),
+),
+
                   const SizedBox(height: 28),
                   const SectionHeader(title: 'Recent'),
                   clinicsAsync.when(
@@ -182,8 +322,7 @@ class AdminDashboard extends ConsumerWidget {
                         );
                       }
                       return Column(
-                        children:
-                            entities.take(3).map((c) {
+                        children: entities.take(3).map((c) {
                           final isLab = c.isLab;
                           final accent = isLab
                               ? AppColors.labAccent

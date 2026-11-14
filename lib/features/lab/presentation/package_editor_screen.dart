@@ -1,4 +1,6 @@
 // lib/features/lab/presentation/package_editor_screen.dart
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -11,14 +13,23 @@ import '../../../core/widgets/glass_card.dart';
 
 /// Fetch the selected offerings (from catalog/main so prices are
 /// included) for the live preview.
+///
+/// The key uses a `String` (sorted, comma-joined offering IDs) instead of a
+/// `List<String>` because a `List` uses identity equality in Dart — passing a
+/// fresh list on every rebuild would create a new provider instance each frame
+/// and re-fire the Firestore read continuously.
 typedef _OfferingPriceKey = ({
   String labClinicId,
-  List<String> offeringIds,
+  String offeringIdsKey,
 });
 
 final _selectedOfferingsProvider = FutureProvider.autoDispose
     .family<List<Map<String, dynamic>>, _OfferingPriceKey>((ref, key) async {
-  if (key.offeringIds.isEmpty) return const [];
+  final ids = key.offeringIdsKey.isEmpty
+      ? const <String>[]
+      : key.offeringIdsKey.split(',');
+  if (ids.isEmpty) return const [];
+
   final catSnap = await FirebaseFirestore.instance
       .collection('clinics')
       .doc(key.labClinicId)
@@ -34,7 +45,7 @@ final _selectedOfferingsProvider = FutureProvider.autoDispose
     final id = (m['offeringId'] ?? '').toString();
     if (id.isNotEmpty) byOfferingId[id] = m;
   }
-  return key.offeringIds
+  return ids
       .map((id) => byOfferingId[id])
       .whereType<Map<String, dynamic>>()
       .toList();
@@ -57,8 +68,7 @@ class PackageEditorScreen extends ConsumerStatefulWidget {
       _PackageEditorScreenState();
 }
 
-class _PackageEditorScreenState
-    extends ConsumerState<PackageEditorScreen> {
+class _PackageEditorScreenState extends ConsumerState<PackageEditorScreen> {
   late final TextEditingController _nameCtrl;
   late final TextEditingController _descCtrl;
   late final TextEditingController _tatCtrl;
@@ -67,6 +77,7 @@ class _PackageEditorScreenState
   final Set<String> _selectedOfferingIds = {};
   bool _active = true;
   bool _saving = false;
+  bool _loadingTests = false;
   String? _nameError;
   String? _testsError;
 
@@ -84,9 +95,9 @@ class _PackageEditorScreenState
         TextEditingController(text: (e?['notes'] ?? '').toString());
 
     if (e != null) {
-      final ids = (e['includedTestOfferingIds'] as List?)
-              ?.cast<String>() ??
-          const <String>[];
+      final ids =
+          (e['includedTestOfferingIds'] as List?)?.cast<String>() ??
+              const <String>[];
       _selectedOfferingIds.addAll(ids);
       _active = e['active'] != false;
     }
@@ -101,6 +112,12 @@ class _PackageEditorScreenState
     super.dispose();
   }
 
+  /// Stable, order-independent key for the offerings provider.
+  String get _offeringIdsKey {
+    final sorted = _selectedOfferingIds.toList()..sort();
+    return sorted.join(',');
+  }
+
   Future<void> _save() async {
     setState(() {
       _nameError = null;
@@ -110,8 +127,7 @@ class _PackageEditorScreenState
     final name = _nameCtrl.text.trim();
     var hasError = false;
     if (name.length < 3) {
-      setState(() =>
-          _nameError = 'Name must be at least 3 characters.');
+      setState(() => _nameError = 'Name must be at least 3 characters.');
       hasError = true;
     }
     if (_selectedOfferingIds.isEmpty) {
@@ -156,9 +172,8 @@ class _PackageEditorScreenState
       if (!mounted) return;
       Navigator.of(context).pop();
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(widget.isEdit
-            ? 'Package updated.'
-            : 'Package created.'),
+        content:
+            Text(widget.isEdit ? 'Package updated.' : 'Package created.'),
         backgroundColor: AppColors.success,
       ));
     } catch (e) {
@@ -174,44 +189,73 @@ class _PackageEditorScreenState
   }
 
   Future<void> _pickTests() async {
-    final offeringList = await ref
-        .read(labServiceProvider)
-        .watchLabTests(
-            labClinicId: widget.labClinicId, includeInactive: false)
-        .first;
-    final pickerList = offeringList
-        .map((t) => <String, dynamic>{
-              'offeringId': t.id,
-              'code': t.code,
-              'name': t.name,
-              'category': t.category,
-              'sampleType': t.sampleType,
-            })
-        .toList();
-    if (!mounted) return;
-    if (pickerList.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-        content: Text(
-            'Add tests to your catalogue first before building a package.'),
-        backgroundColor: AppColors.warning,
-      ));
-      return;
-    }
-    final chosen = await showModalBottomSheet<Set<String>>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (_) => _TestPickerSheet(
-        offerings: pickerList,
-        preselected: _selectedOfferingIds,
-      ),
-    );
-    if (chosen != null && mounted) {
-      setState(() {
-        _selectedOfferingIds
-          ..clear()
-          ..addAll(chosen);
-      });
+    if (_loadingTests) return;
+    setState(() => _loadingTests = true);
+
+    final messenger = ScaffoldMessenger.of(context);
+
+    try {
+      final offeringList = await ref
+          .read(labServiceProvider)
+          .watchLabTests(
+              labClinicId: widget.labClinicId, includeInactive: false)
+          .first
+          .timeout(const Duration(seconds: 15));
+
+      if (!mounted) return;
+
+      final pickerList = offeringList
+          .map((t) => <String, dynamic>{
+                'offeringId': t.id,
+                'code': t.code,
+                'name': t.name,
+                'category': t.category,
+                'sampleType': t.sampleType,
+              })
+          .toList();
+
+      if (pickerList.isEmpty) {
+        messenger.showSnackBar(const SnackBar(
+          content: Text(
+              'Add tests to your catalogue first before building a package.'),
+          backgroundColor: AppColors.warning,
+        ));
+        return;
+      }
+
+      final chosen = await showModalBottomSheet<Set<String>>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: Colors.transparent,
+        builder: (_) => _TestPickerSheet(
+          offerings: pickerList,
+          preselected: _selectedOfferingIds,
+        ),
+      );
+
+      if (chosen != null && mounted) {
+        setState(() {
+          _selectedOfferingIds
+            ..clear()
+            ..addAll(chosen);
+        });
+      }
+    } on TimeoutException {
+      if (mounted) {
+        messenger.showSnackBar(const SnackBar(
+          content: Text('Could not load tests. Check your connection.'),
+          backgroundColor: AppColors.error,
+        ));
+      }
+    } catch (e) {
+      if (mounted) {
+        messenger.showSnackBar(SnackBar(
+          content: Text('Failed to load tests: $e'),
+          backgroundColor: AppColors.error,
+        ));
+      }
+    } finally {
+      if (mounted) setState(() => _loadingTests = false);
     }
   }
 
@@ -246,8 +290,7 @@ class _PackageEditorScreenState
     try {
       await ref.read(labServiceProvider).deletePackage(
             labClinicId: widget.labClinicId,
-            packageId:
-                (widget.existing!['packageId'] ?? '').toString(),
+            packageId: (widget.existing!['packageId'] ?? '').toString(),
           );
       if (!mounted) return;
       Navigator.of(context).pop();
@@ -398,6 +441,32 @@ class _PackageEditorScreenState
 
   Widget _includedTestsSection() {
     if (_selectedOfferingIds.isEmpty) {
+      // While the catalogue is loading, show a spinner instead of the
+      // tappable card so the user gets immediate feedback.
+      if (_loadingTests) {
+        return GlassCard(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(children: [
+              const SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(
+                    strokeWidth: 2, color: AppColors.primary),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  'Loading tests…',
+                  style: AppTextStyles.body
+                      .copyWith(color: AppColors.textMuted),
+                ),
+              ),
+            ]),
+          ),
+        );
+      }
+
       return InkWell(
         borderRadius: BorderRadius.circular(14),
         onTap: _pickTests,
@@ -425,7 +494,7 @@ class _PackageEditorScreenState
 
     final offeringsAsync = ref.watch(_selectedOfferingsProvider((
       labClinicId: widget.labClinicId,
-      offeringIds: _selectedOfferingIds.toList(),
+      offeringIdsKey: _offeringIdsKey,
     )));
 
     return Column(
@@ -433,8 +502,8 @@ class _PackageEditorScreenState
       children: [
         GlassCard(
           child: Padding(
-            padding: const EdgeInsets.symmetric(
-                horizontal: 12, vertical: 8),
+            padding:
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             child: Row(children: [
               Text(
                 '${_selectedOfferingIds.length} test${_selectedOfferingIds.length == 1 ? "" : "s"} selected',
@@ -442,21 +511,31 @@ class _PackageEditorScreenState
                     .copyWith(fontWeight: FontWeight.w600),
               ),
               const Spacer(),
-              TextButton(
-                onPressed: _pickTests,
-                style: TextButton.styleFrom(
-                  foregroundColor: AppColors.info,
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 8),
-                  minimumSize: const Size(0, 0),
-                  tapTargetSize:
-                      MaterialTapTargetSize.shrinkWrap,
+              if (_loadingTests)
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 8),
+                  child: SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: AppColors.primary),
+                  ),
+                )
+              else
+                TextButton(
+                  onPressed: _pickTests,
+                  style: TextButton.styleFrom(
+                    foregroundColor: AppColors.info,
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8),
+                    minimumSize: const Size(0, 0),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  child: const Text('Change',
+                      style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600)),
                 ),
-                child: const Text('Change',
-                    style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600)),
-              ),
             ]),
           ),
         ),
@@ -553,16 +632,16 @@ class _PackageEditorScreenState
                           const SizedBox(width: 10),
                           Expanded(
                             child: Text('Computed package price',
-                                style: AppTextStyles.body
-                                    .copyWith(
-                                        fontWeight: FontWeight.w600)),
+                                style: AppTextStyles.body.copyWith(
+                                    fontWeight: FontWeight.w600)),
                           ),
                           if (hasDiscount) ...[
                             Text(
                               '₹${sumMrp.toStringAsFixed(0)}',
                               style: AppTextStyles.caption.copyWith(
                                 color: AppColors.textMuted,
-                                decoration: TextDecoration.lineThrough,
+                                decoration:
+                                    TextDecoration.lineThrough,
                               ),
                             ),
                             const SizedBox(width: 6),
@@ -690,12 +769,15 @@ class _TestPickerSheetState extends State<_TestPickerSheet> {
       minChildSize: 0.5,
       maxChildSize: 0.95,
       expand: false,
-      builder: (_, scrollCtrl) => Container(
-        decoration: const BoxDecoration(
-          color: AppColors.background,
-          borderRadius:
-              BorderRadius.vertical(top: Radius.circular(24)),
-        ),
+      builder: (_, scrollCtrl) => Material(
+        // `Material` acts as the ink surface for the CheckboxListTile rows.
+        // Without it (i.e. with only a colored Container / DecoratedBox),
+        // every CheckboxListTile throws:
+        //   "ListTile background color or ink splashes may be invisible."
+        // which floods logcat and can stall the UI thread.
+        color: AppColors.background,
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        clipBehavior: Clip.antiAlias,
         child: Column(
           children: [
             const SizedBox(height: 12),
@@ -780,8 +862,8 @@ class _TestPickerSheetState extends State<_TestPickerSheet> {
             SafeArea(
               child: Container(
                 decoration: const BoxDecoration(
-                  border: Border(
-                      top: BorderSide(color: AppColors.cardBorder)),
+                  border:
+                      Border(top: BorderSide(color: AppColors.cardBorder)),
                 ),
                 padding: const EdgeInsets.fromLTRB(20, 12, 20, 12),
                 child: SizedBox(
@@ -802,8 +884,8 @@ class _TestPickerSheetState extends State<_TestPickerSheet> {
                       _selected.isEmpty
                           ? 'Select tests'
                           : 'Use ${_selected.length} test${_selected.length == 1 ? "" : "s"}',
-                      style: const TextStyle(
-                          fontWeight: FontWeight.w600),
+                      style:
+                          const TextStyle(fontWeight: FontWeight.w600),
                     ),
                   ),
                 ),

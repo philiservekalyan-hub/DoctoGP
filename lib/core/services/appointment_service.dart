@@ -204,61 +204,74 @@ class AppointmentService {
     });
   }
 
-Future<void> startConsult(String appointmentDocId) async {
-  await FirebaseFirestore.instance
-      .collection('appointments')
-      .doc(appointmentDocId)
-      .update({
-    'status': AppointmentStatus.inConsult.name,
-    'consultStartedAt': FieldValue.serverTimestamp(),
-  });
-}
+  Future<void> startConsult(String appointmentDocId) async {
+    await FirebaseFirestore.instance
+        .collection('appointments')
+        .doc(appointmentDocId)
+        .update({
+      'status': AppointmentStatus.inConsult.name,
+      'consultStartedAt': FieldValue.serverTimestamp(),
+    });
+  }
+
+  /// Reverts an in-progress consultation back to the checked-in state
+  /// so the patient returns to the doctor's queue.
+  Future<void> revertToCheckedIn(String appointmentDocId) async {
+    await FirebaseFirestore.instance
+        .collection('appointments')
+        .doc(appointmentDocId)
+        .update({
+      'status': AppointmentStatus.checkedIn.name,
+      'consultStartedAt': null,
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
+  }
 
   Future<void> completeConsultation({
-  required String appointmentDocId,
-  required double fees,
-  required String doctorUid,
-}) async {
-  if (fees < 0) throw ArgumentError('Fees cannot be negative');
-  await FirebaseFirestore.instance
-      .collection('appointments')
-      .doc(appointmentDocId)
-      .update({
-    'status': AppointmentStatus.completed.name,
-    'consultEndedAt': FieldValue.serverTimestamp(),
-    'consultationFees': fees,
-    'feesSetByDoctorId': doctorUid,
-    'paymentStatus': PaymentStatus.unpaid.name,
-  });
-}
+    required String appointmentDocId,
+    required double fees,
+    required String doctorUid,
+  }) async {
+    if (fees < 0) throw ArgumentError('Fees cannot be negative');
+    await FirebaseFirestore.instance
+        .collection('appointments')
+        .doc(appointmentDocId)
+        .update({
+      'status': AppointmentStatus.completed.name,
+      'consultEndedAt': FieldValue.serverTimestamp(),
+      'consultationFees': fees,
+      'feesSetByDoctorId': doctorUid,
+      'paymentStatus': PaymentStatus.unpaid.name,
+    });
+  }
 
-Future<void> markFeesPaid({
-  required String appointmentDocId,
-  required String collectedByUid,
-}) async {
-  await FirebaseFirestore.instance
-      .collection('appointments')
-      .doc(appointmentDocId)
-      .update({
-    'paymentStatus': PaymentStatus.paid.name,
-    'feesPaidAt': FieldValue.serverTimestamp(),
-    'feesCollectedByUid': collectedByUid,
-  });
-}
+  Future<void> markFeesPaid({
+    required String appointmentDocId,
+    required String collectedByUid,
+  }) async {
+    await FirebaseFirestore.instance
+        .collection('appointments')
+        .doc(appointmentDocId)
+        .update({
+      'paymentStatus': PaymentStatus.paid.name,
+      'feesPaidAt': FieldValue.serverTimestamp(),
+      'feesCollectedByUid': collectedByUid,
+    });
+  }
 
   Future<void> waiveFees({
-  required String appointmentDocId,
-  required String collectedByUid,
-}) async {
-  await FirebaseFirestore.instance
-      .collection('appointments')
-      .doc(appointmentDocId)
-      .update({
-    'paymentStatus': PaymentStatus.waived.name,
-    'feesPaidAt': FieldValue.serverTimestamp(),
-    'feesCollectedByUid': collectedByUid,
-  });
-}
+    required String appointmentDocId,
+    required String collectedByUid,
+  }) async {
+    await FirebaseFirestore.instance
+        .collection('appointments')
+        .doc(appointmentDocId)
+        .update({
+      'paymentStatus': PaymentStatus.waived.name,
+      'feesPaidAt': FieldValue.serverTimestamp(),
+      'feesCollectedByUid': collectedByUid,
+    });
+  }
 
   /// Resumes a held appointment.
   Future<void> resumeAppointment(String docId) async {
@@ -328,7 +341,6 @@ Future<void> markFeesPaid({
   bool _isSameDay(DateTime a, DateTime b) =>
       a.year == b.year && a.month == b.month && a.day == b.day;
 
-
   /// Staff-initiated cancellation (as opposed to patient-initiated).
   Future<void> cancelByStaff(String docId, {String? reason}) async {
     await _db.collection('appointments').doc(docId).update({
@@ -384,8 +396,6 @@ Future<void> markFeesPaid({
 
     return appt.copyWith(status: AppointmentStatus.inConsult);
   }
-
-
 
   // -----------------------------------------------------------------
   // Streams
@@ -501,7 +511,7 @@ Future<void> markFeesPaid({
             d.exists ? AppointmentModel.fromMap(d.id, d.data()!) : null);
   }
 
- Stream<List<AppointmentModel>> searchUpcoming(String query) {
+  Stream<List<AppointmentModel>> searchUpcoming(String query) {
     final now = DateTime.now();
     final start = DateTime(now.year, now.month, now.day);
     final end = start.add(const Duration(days: 30));
@@ -534,7 +544,6 @@ Future<void> markFeesPaid({
       return list;
     });
   }
-
 
   Stream<List<AppointmentModel>> watchClinicAppointments({
     required DateTime date,

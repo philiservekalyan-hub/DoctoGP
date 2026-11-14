@@ -1,9 +1,12 @@
+// lib/features/patient/presentation/patient_dashboard.dart
 import 'dart:typed_data';
+import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -15,14 +18,22 @@ import '../../../app/theme/app_colors.dart';
 import '../../../app/theme/app_text_styles.dart';
 import '../../../core/models/appointment_model.dart';
 import '../../../core/models/appointment_request_model.dart';
+import '../../../core/models/consultation_model.dart';
 import '../../../core/models/lab_order_model.dart';
 import '../../../core/providers/service_providers.dart';
 import '../../../core/services/appointment_request_service.dart';
 import '../../../core/services/appointment_service.dart';
+import '../../../core/services/consultation_service.dart';
 import '../../../core/widgets/glass_card.dart';
 import '../../../core/widgets/section_header.dart';
 import '../../../core/widgets/stat_card.dart';
 import '../../../shared/widgets/role_badge.dart';
+import '../../chemist/presentation/prescription_order_screen.dart';
+import '../../../core/models/prescription_order_model.dart';
+import '../../../core/models/chemist_model.dart';
+import '../../chemist/presentation/patient_order_tracking_screen.dart';
+import 'widgets/sponsored_offers_carousel.dart';
+import '../../../core/models/pill_models.dart';
 
 // -----------------------------------------------------------------
 // Providers
@@ -85,6 +96,76 @@ final slotQueueProvider =
   return ref
       .read(appointmentServiceProvider)
       .watchSlotQueue(doctorDocId: doctorDocId, slotKey: slotKey);
+});
+
+final pillSchedulesProvider =
+    StreamProvider.autoDispose<List<PillSchedule>>((ref) {
+  final authUid = FirebaseAuth.instance.currentUser?.uid;
+  if (authUid == null) return const Stream.empty();
+
+  return FirebaseFirestore.instance
+      .collection('pillSchedules')
+      .where('patientAuthUid', isEqualTo: authUid)
+      .where('active', isEqualTo: true)
+      .snapshots()
+      .map((s) => s.docs
+          .map((d) => PillSchedule.fromMap(d.id, d.data()))
+          .toList());
+});
+
+final todayPillDosesProvider =
+    StreamProvider.autoDispose<List<PillDose>>((ref) {
+  final authUid = FirebaseAuth.instance.currentUser?.uid;
+  if (authUid == null) return const Stream.empty();
+
+  final now = DateTime.now();
+  final start = DateTime(now.year, now.month, now.day);
+  final end = start.add(const Duration(days: 1));
+
+  return FirebaseFirestore.instance
+      .collection('pillDoses')
+      .where('patientAuthUid', isEqualTo: authUid)
+      .where('scheduledAt',
+          isGreaterThanOrEqualTo: Timestamp.fromDate(start))
+      .where('scheduledAt', isLessThan: Timestamp.fromDate(end))
+      .orderBy('scheduledAt')
+      .snapshots()
+      .map((s) =>
+          s.docs.map((d) => PillDose.fromMap(d.id, d.data())).toList());
+});
+
+final upcomingPillDosesProvider =
+    StreamProvider.autoDispose<List<PillDose>>((ref) {
+  final authUid = FirebaseAuth.instance.currentUser?.uid;
+  if (authUid == null) return const Stream.empty();
+
+  return FirebaseFirestore.instance
+      .collection('pillDoses')
+      .where('patientAuthUid', isEqualTo: authUid)
+      .where('scheduledAt', isGreaterThan: Timestamp.now())
+      .orderBy('scheduledAt')
+      .limit(30)
+      .snapshots()
+      .map((s) =>
+          s.docs.map((d) => PillDose.fromMap(d.id, d.data())).toList());
+});
+
+final patientEmergencyContactProvider =
+    StreamProvider.autoDispose<Map<String, dynamic>?>((ref) {
+  final authUid = FirebaseAuth.instance.currentUser?.uid;
+  if (authUid == null) return const Stream.empty();
+
+  return FirebaseFirestore.instance
+      .collection('emergencyContacts')
+      .where('patientAuthUid', isEqualTo: authUid)
+      .where('active', isEqualTo: true)
+      .limit(1)
+      .snapshots()
+      .map((snap) {
+    if (snap.docs.isEmpty) return null;
+    final d = snap.docs.first;
+    return <String, dynamic>{'contactDocId': d.id, ...d.data()};
+  });
 });
 
 final patientLabOrdersProvider =
@@ -156,25 +237,26 @@ final currentPatientProvider =
     FutureProvider.autoDispose<Map<String, dynamic>?>((ref) async {
   final user = await ref.watch(currentUserProvider.future);
   if (user == null) return null;
-debugPrint('currentPatientProvider uid=${user.uid} email=${user.email}'); 
+  debugPrint('currentPatientProvider uid=${user.uid} email=${user.email}');
   final db = FirebaseFirestore.instance;
   final userDoc = await db.collection('users').doc(user.uid).get();
   final userData = userDoc.data() ?? {};
 
   // 1. Clinic patient record — preferred whenever present.
   final linkedPatientDocId = (userData['linkedPatientDocId'] ?? '')
-    .toString()
-    .replaceAll('"', '')
-    .replaceAll(RegExp(r'\s'), '')   // strips trailing/NBSP/tab/CR/LF
-    .trim();
-if (linkedPatientDocId.isNotEmpty) {
-  final p = await db.collection('patients').doc(linkedPatientDocId).get();
-  debugPrint('currentPatientProvider: linkedPatientDocId=[$linkedPatientDocId] '
-             'len=${linkedPatientDocId.length} exists=${p.exists}');
-  if (p.exists) return _patientMap(p, user.uid);
-  debugPrint('WARN: linkedPatientDocId set but patients doc missing — '
-             'falling through to lab-customer path');
-}
+      .toString()
+      .replaceAll('"', '')
+      .replaceAll(RegExp(r'\s'), '')
+      .trim();
+  if (linkedPatientDocId.isNotEmpty) {
+    final p =
+        await db.collection('patients').doc(linkedPatientDocId).get();
+    debugPrint('currentPatientProvider: linkedPatientDocId=[$linkedPatientDocId] '
+        'len=${linkedPatientDocId.length} exists=${p.exists}');
+    if (p.exists) return _patientMap(p, user.uid);
+    debugPrint('WARN: linkedPatientDocId set but patients doc missing — '
+        'falling through to lab-customer path');
+  }
 
   // 2. Lab customer record — lab-only customer path.
   final linkedLabCustomerDocId =
@@ -274,19 +356,132 @@ final patientDocumentsProvider = StreamProvider.autoDispose<
             .compareTo(_asDate(a.data()['createdAt']))));
 });
 
-final patientInvoicesProvider = StreamProvider.autoDispose<
-    List<QueryDocumentSnapshot<Map<String, dynamic>>>>((ref) {
+final patientPharmacyBillsProvider =
+    StreamProvider.autoDispose<List<PrescriptionOrderModel>>((ref) {
   final patient = ref.watch(currentPatientProvider).valueOrNull;
   if (patient == null || patient['isLabCustomer'] == true) {
     return const Stream.empty();
   }
+  final patientDocId = patient['patientDocId'] as String;
+
   return FirebaseFirestore.instance
-      .collection('invoices')
-      .where('patientDocId', isEqualTo: patient['patientDocId'])
+      .collection('prescriptionOrders')
+      .where('patientDocId', isEqualTo: patientDocId)
+      .where('status', whereIn: [
+        'billed',
+        'paidPendingVerification',
+        'paid',
+        'preparing',
+        'outForDelivery',
+        'delivered',
+      ])
+      .orderBy('placedAt', descending: true)
       .snapshots()
-      .map((s) => s.docs.toList()
-        ..sort((a, b) => _asDate(b.data()['createdAt'])
-            .compareTo(_asDate(a.data()['createdAt']))));
+      .map((snap) => snap.docs
+          .map((d) => PrescriptionOrderModel.fromMap(d.id, d.data()))
+          .toList());
+});
+
+final patientBillingProvider =
+    StreamProvider.autoDispose<List<AppointmentModel>>((ref) {
+  final patient = ref.watch(currentPatientProvider).valueOrNull;
+  if (patient == null || patient['isLabCustomer'] == true) {
+    return const Stream.empty();
+  }
+  final patientDocId = patient['patientDocId'] as String;
+
+  return FirebaseFirestore.instance
+      .collection('appointments')
+      .where('patientDocId', isEqualTo: patientDocId)
+      .snapshots()
+      .map((snap) {
+    final list = snap.docs
+        .map((d) => AppointmentModel.fromMap(d.id, d.data()))
+        .where((a) =>
+            a.consultationFees != null && a.consultationFees! > 0)
+        .toList()
+      ..sort((a, b) {
+        final at = a.consultEndedAt ?? a.slot;
+        final bt = b.consultEndedAt ?? b.slot;
+        return bt.compareTo(at);
+      });
+
+    return list;
+  });
+});
+
+// -----------------------------------------------------------------
+// NEW — Consent + security providers
+// -----------------------------------------------------------------
+final patientConsentProvider =
+    StreamProvider.autoDispose<Map<String, dynamic>?>((ref) {
+  final userAsync = ref.watch(currentUserProvider);
+  return userAsync.when(
+    loading: () => const Stream.empty(),
+    error: (_, __) => const Stream.empty(),
+    data: (user) {
+      if (user == null) return const Stream.empty();
+      return FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.uid)
+          .snapshots()
+          .map((snap) {
+        final d = snap.data();
+        if (d == null) return null;
+        return <String, dynamic>{
+          'consent_status': d['consent_status'] == true,
+          'consent_version': d['consent_version'] as String?,
+          'consent_accepted_purposes':
+              (d['consent_accepted_purposes'] as List?)?.cast<String>() ??
+                  const <String>[],
+          'consent_updated_at': d['consent_updated_at'],
+          'is_minor': d['is_minor'] == true,
+          'guardian_name': d['guardian_name'],
+          'guardian_relationship': d['guardian_relationship'],
+        };
+      });
+    },
+  );
+});
+
+final patientSecurityPrefsProvider =
+    StreamProvider.autoDispose<Map<String, dynamic>>((ref) {
+  final userAsync = ref.watch(currentUserProvider);
+  return userAsync.when(
+    loading: () => const Stream.empty(),
+    error: (_, __) => const Stream.empty(),
+    data: (user) {
+      if (user == null) return const Stream.empty();
+      return FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.uid)
+          .snapshots()
+          .map((snap) =>
+              (snap.data()?['security'] as Map<String, dynamic>?) ?? {});
+    },
+  );
+});
+
+// -----------------------------------------------------------------
+// Consultation stream — keyed by appointment doc ID
+// -----------------------------------------------------------------
+final appointmentConsultationProvider = StreamProvider.autoDispose
+    .family<ConsultationModel?, String>((ref, appointmentDocId) {
+  return ConsultationService()
+      .watchByAppointment(appointmentDocId)
+      .transform(StreamTransformer<ConsultationModel?, ConsultationModel?>.fromHandlers(
+    handleData: (data, sink) => sink.add(data),
+    handleError: (error, stack, sink) {
+      if (error is FirebaseException &&
+          (error.code == 'permission-denied' ||
+              error.code == 'permission_denied')) {
+        sink.add(null);
+        sink.close();
+      } else {
+        sink.addError(error, stack);
+      }
+    },
+  ));
 });
 
 DateTime _asDate(dynamic value) {
@@ -360,6 +555,7 @@ class PatientDashboard extends ConsumerStatefulWidget {
 class _PatientDashboardState extends ConsumerState<PatientDashboard> {
   String _selectedTabLabel = 'Overview';
   LabOrderStatus? _labFilter;
+  bool _refreshing = false;
 
   static const _fullTabs = <({String label, IconData icon})>[
     (label: 'Overview', icon: Icons.dashboard_rounded),
@@ -370,12 +566,14 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
     (label: 'Documents', icon: Icons.folder_copy_rounded),
     (label: 'Billing', icon: Icons.receipt_long_rounded),
     (label: 'Profile', icon: Icons.person_rounded),
+    (label: 'Privacy & security', icon: Icons.shield_rounded),
   ];
 
   static const _labOnlyTabs = <({String label, IconData icon})>[
     (label: 'Overview', icon: Icons.dashboard_rounded),
     (label: 'Lab reports', icon: Icons.science_rounded),
     (label: 'Profile', icon: Icons.person_rounded),
+    (label: 'Privacy & security', icon: Icons.shield_rounded),
   ];
 
   bool _isLabOnly(Map<String, dynamic> patient) =>
@@ -423,13 +621,18 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
                 return RefreshIndicator(
                   color: AppColors.primary,
                   onRefresh: () async {
-                    ref.invalidate(currentPatientProvider);
-                    ref.invalidate(patientAppointmentsProvider);
-                    ref.invalidate(patientDocumentsProvider);
-                    ref.invalidate(patientInvoicesProvider);
-                    ref.invalidate(patientRequestsProvider);
-                    ref.invalidate(patientLabOrdersProvider);
-                  },
+  await Future.wait([
+    ref.refresh(currentPatientProvider.future),
+    ref.refresh(patientAppointmentsProvider.future),
+    ref.refresh(patientDocumentsProvider.future),
+    ref.refresh(patientBillingProvider.future),
+    ref.refresh(patientRequestsProvider.future),
+    ref.refresh(patientLabOrdersProvider.future),
+    ref.refresh(patientConsentProvider.future),
+    ref.refresh(patientSecurityPrefsProvider.future),
+  ]);
+},
+
                   child: CustomScrollView(
                     physics: const AlwaysScrollableScrollPhysics(),
                     slivers: [
@@ -456,8 +659,10 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
                                 'Medical records' =>
                                   _medicalRecords(patient),
                                 'Documents' => _documents(patient),
-                                'Billing' => _billing(),
+                                'Billing' => _billing(patient),
                                 'Profile' => _profile(patient),
+                                'Privacy & security' =>
+                                  _privacyAndSecurity(patient),
                                 _ => _overview(patient, name, apptAsync),
                               },
                             ],
@@ -496,45 +701,77 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
           ]),
         ),
       );
-
-  Widget _topBar(String name, String email) => Row(children: [
-        Container(
+Widget _topBar(String name, String email) => Row(children: [
+      ClipRRect(
+        borderRadius: BorderRadius.circular(15),
+        child: Image.asset(
+          'assets/images/icon.png',
           width: 46,
           height: 46,
-          decoration: BoxDecoration(
-            color: AppColors.patientAccent.withOpacity(.14),
-            borderRadius: BorderRadius.circular(15),
+          fit: BoxFit.cover,
+          errorBuilder: (_, __, ___) => Container(
+            width: 46,
+            height: 46,
+            decoration: BoxDecoration(
+              color: AppColors.patientAccent.withOpacity(.14),
+              borderRadius: BorderRadius.circular(15),
+            ),
+            child: const Icon(Icons.health_and_safety_rounded,
+                color: AppColors.patientAccent, size: 27),
           ),
-          child: const Icon(Icons.health_and_safety_rounded,
-              color: AppColors.patientAccent, size: 27),
         ),
-        const SizedBox(width: 12),
-        Expanded(
-          child:
-              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('STAT', style: AppTextStyles.h3),
-            Text('Patient portal', style: AppTextStyles.caption),
-          ]),
-        ),
-        IconButton(
-          tooltip: 'Refresh dashboard',
-          onPressed: () {
-            ref.invalidate(currentPatientProvider);
-            ref.invalidate(patientAppointmentsProvider);
-            ref.invalidate(patientDocumentsProvider);
-            ref.invalidate(patientInvoicesProvider);
-            ref.invalidate(patientRequestsProvider);
-            ref.invalidate(patientLabOrdersProvider);
-          },
-          icon: const Icon(Icons.refresh_rounded),
-        ),
-        IconButton(
-          tooltip: 'Logout',
-          onPressed: _confirmLogout,
-          icon: const Icon(Icons.logout_rounded, color: AppColors.error),
-        ),
-        const RoleBadge(label: 'Patient', color: AppColors.patientAccent),
-      ]);
+      ),
+      const SizedBox(width: 12),
+      Expanded(
+        child:
+            Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('STAT', style: AppTextStyles.h3),
+          Text('Patient portal', style: AppTextStyles.caption),
+        ]),
+      ),
+      IconButton(
+  tooltip: 'Refresh dashboard',
+  onPressed: _refreshing ? null : _refreshAll,
+  icon: _refreshing
+      ? const SizedBox(
+          width: 20,
+          height: 20,
+          child: CircularProgressIndicator(
+            strokeWidth: 2,
+            color: AppColors.patientAccent,
+          ),
+        )
+      : const Icon(Icons.refresh_rounded),
+),
+      IconButton(
+        tooltip: 'Logout',
+        onPressed: _confirmLogout,
+        icon: const Icon(Icons.logout_rounded, color: AppColors.error),
+      ),
+      const RoleBadge(label: 'Patient', color: AppColors.patientAccent),
+    ]);
+
+Future<void> _refreshAll() async {
+  if (_refreshing) return;
+  setState(() => _refreshing = true);
+  try {
+    await Future.wait([
+      ref.refresh(currentPatientProvider.future),
+      ref.refresh(patientAppointmentsProvider.future),
+      ref.refresh(patientDocumentsProvider.future),
+      ref.refresh(patientBillingProvider.future),
+      ref.refresh(patientRequestsProvider.future),
+      ref.refresh(patientLabOrdersProvider.future),
+      ref.refresh(patientConsentProvider.future),
+      ref.refresh(patientSecurityPrefsProvider.future),
+    ]);
+  } catch (e) {
+    if (mounted) _toast('Refresh failed: $e', AppColors.error);
+  } finally {
+    if (mounted) setState(() => _refreshing = false);
+  }
+}
+
 
   Future<void> _confirmLogout() async {
     final shouldLogout = await showDialog<bool>(
@@ -633,8 +870,13 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
       const SizedBox(height: 5),
       Text('Here is your personal health overview.',
           style: AppTextStyles.bodyMuted),
-      const SizedBox(height: 20),
+           const SizedBox(height: 20),
       _heroCard(),
+      SponsoredOffersCarousel(
+        flow: 'dashboard',
+        patientUid: patient['authUid'] as String?,
+	patient: patient,
+      ),
       const SizedBox(height: 22),
       _bookAppointmentCard(patient),
       const SizedBox(height: 22),
@@ -657,13 +899,16 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
       Row(children: [
         Expanded(
             child: StatCard(
-                label: 'Invoices',
-                value: ref
-                        .watch(patientInvoicesProvider)
-                        .valueOrNull
-                        ?.length
-                        .toString() ??
-                    '—',
+                label: 'Billed',
+                value: (() {
+                  final lines =
+                      ref.watch(patientBillingProvider).valueOrNull ??
+                          const <AppointmentModel>[];
+                  if (lines.isEmpty) return '—';
+                  final total = lines.fold<double>(
+                      0, (s, a) => s + (a.consultationFees ?? 0));
+                  return _money(total);
+                })(),
                 icon: Icons.receipt_long_rounded,
                 accent: AppColors.success)),
         const SizedBox(width: 10),
@@ -766,8 +1011,13 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
       const SizedBox(height: 6),
       Text('Your lab reports appear here.',
           style: AppTextStyles.bodyMuted),
-      const SizedBox(height: 20),
+            const SizedBox(height: 20),
       _heroCard(),
+      SponsoredOffersCarousel(
+        flow: 'dashboard',
+        patientUid: patient['authUid'] as String?,
+         patient: patient,
+      ),
       const SizedBox(height: 22),
       Row(children: [
         Expanded(
@@ -1156,13 +1406,26 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
                   children: sorted
                       .map((a) => Padding(
                             padding: const EdgeInsets.only(bottom: 12),
-                            child: _appointmentCard(a, patient: patient),
+                            child: _appointmentCard(
+                              a,
+                              patient: patient,
+                              onTap: () => _openAppointmentDetail(a),
+                            ),
                           ))
                       .toList());
             },
           ),
         ],
       );
+
+  void _openAppointmentDetail(AppointmentModel a) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => _AppointmentDetailScreen(appointment: a),
+      ),
+    );
+  }
 
   Widget _queue(AsyncValue<List<AppointmentModel>> async) => Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1480,6 +1743,7 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
     AppointmentModel appt, {
     bool compact = false,
     Map<String, dynamic>? patient,
+    VoidCallback? onTap,
   }) {
     final needsConfirmation =
         appt.status == AppointmentStatus.awaitingConfirmation ||
@@ -1496,105 +1760,126 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
           : (appt.status == AppointmentStatus.confirmed
               ? AppColors.success
               : AppColors.cardBorder),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(children: [
-            Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                decoration: BoxDecoration(
-                    color: AppColors.patientAccent.withOpacity(.13),
-                    borderRadius: BorderRadius.circular(8)),
-                child: Text(
-                    appt.tokenNumber > 0 ? appt.tokenLabel : 'Pending token',
-                    style: AppTextStyles.caption
-                        .copyWith(color: AppColors.patientAccent))),
-            const Spacer(),
-            _statusChip(appt),
-          ]),
-          const SizedBox(height: 13),
-          Text(appt.doctorName, style: AppTextStyles.h3),
-          const SizedBox(height: 5),
-          Text(DateFormat('EEE, dd MMM yyyy • hh:mm a').format(appt.slot),
-              style: AppTextStyles.bodyMuted),
-          if (appt.chiefComplaint != null &&
-              appt.chiefComplaint!.trim().isNotEmpty) ...[
-            const SizedBox(height: 7),
-            Text('Reason: ${appt.chiefComplaint}',
-                style: AppTextStyles.caption),
-          ],
-          if (needsConfirmation) ...[
-            const SizedBox(height: 14),
-            _infoBanner('The clinic needs you to confirm this visit.',
-                AppColors.warning, Icons.notifications_active_rounded),
-            const SizedBox(height: 10),
-            Row(children: [
-              Expanded(
-                  child: ElevatedButton.icon(
-                onPressed: () => _confirmAppointment(appt),
-                icon: const Icon(Icons.check_rounded, size: 18),
-                label: const Text('Confirm'),
-                style: ElevatedButton.styleFrom(
-                    backgroundColor: AppColors.success,
-                    foregroundColor: Colors.white),
-              )),
-              const SizedBox(width: 9),
-              Expanded(
+      child: InkWell(
+        borderRadius: BorderRadius.circular(14),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(4),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(children: [
+                Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                    decoration: BoxDecoration(
+                        color: AppColors.patientAccent.withOpacity(.13),
+                        borderRadius: BorderRadius.circular(8)),
+                    child: Text(
+                        appt.tokenNumber > 0 ? appt.tokenLabel : 'Pending token',
+                        style: AppTextStyles.caption
+                            .copyWith(color: AppColors.patientAccent))),
+                const Spacer(),
+                _statusChip(appt),
+              ]),
+              const SizedBox(height: 13),
+              Text(appt.doctorName, style: AppTextStyles.h3),
+              const SizedBox(height: 5),
+              Text(DateFormat('EEE, dd MMM yyyy • hh:mm a').format(appt.slot),
+                  style: AppTextStyles.bodyMuted),
+              if (appt.chiefComplaint != null &&
+                  appt.chiefComplaint!.trim().isNotEmpty) ...[
+                const SizedBox(height: 7),
+                Text('Reason: ${appt.chiefComplaint}',
+                    style: AppTextStyles.caption),
+              ],
+              if (onTap != null) ...[
+                const SizedBox(height: 10),
+                Row(children: [
+                  const Icon(Icons.description_outlined,
+                      size: 15, color: AppColors.textMuted),
+                  const SizedBox(width: 6),
+                  Text('Tap to view details',
+                      style: AppTextStyles.caption
+                          .copyWith(color: AppColors.textMuted)),
+                  const Spacer(),
+                  const Icon(Icons.chevron_right_rounded,
+                      size: 18, color: AppColors.textMuted),
+                ]),
+              ],
+              if (needsConfirmation) ...[
+                const SizedBox(height: 14),
+                _infoBanner('The clinic needs you to confirm this visit.',
+                    AppColors.warning, Icons.notifications_active_rounded),
+                const SizedBox(height: 10),
+                Row(children: [
+                  Expanded(
+                      child: ElevatedButton.icon(
+                    onPressed: () => _confirmAppointment(appt),
+                    icon: const Icon(Icons.check_rounded, size: 18),
+                    label: const Text('Confirm'),
+                    style: ElevatedButton.styleFrom(
+                        backgroundColor: AppColors.success,
+                        foregroundColor: Colors.white),
+                  )),
+                  const SizedBox(width: 9),
+                  Expanded(
+                      child: OutlinedButton.icon(
+                    onPressed: () => _declineAppointment(appt),
+                    icon: const Icon(Icons.close_rounded, size: 18),
+                    label: const Text("Can't come"),
+                    style: OutlinedButton.styleFrom(
+                        foregroundColor: AppColors.error,
+                        side: const BorderSide(color: AppColors.error)),
+                  )),
+                ]),
+              ] else if (!compact &&
+                  appt.status == AppointmentStatus.confirmed) ...[
+                const SizedBox(height: 12),
+                _infoBanner(
+                    'Visit confirmed. Please arrive about 10 minutes early.',
+                    AppColors.success,
+                    Icons.check_circle_outline_rounded),
+              ] else if (appt.status == AppointmentStatus.checkedIn) ...[
+                const SizedBox(height: 12),
+                _infoBanner(
+                    'You are checked in. Watch the queue for your turn.',
+                    AppColors.info,
+                    Icons.how_to_reg_rounded),
+              ] else if (appt.status == AppointmentStatus.inConsult) ...[
+                const SizedBox(height: 12),
+                _infoBanner('It is your turn now. Please see the doctor.',
+                    AppColors.accent, Icons.campaign_rounded),
+              ] else if (appt.status == AppointmentStatus.completed &&
+                  patient != null) ...[
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
                   child: OutlinedButton.icon(
-                onPressed: () => _declineAppointment(appt),
-                icon: const Icon(Icons.close_rounded, size: 18),
-                label: const Text("Can't come"),
-                style: OutlinedButton.styleFrom(
-                    foregroundColor: AppColors.error,
-                    side: const BorderSide(color: AppColors.error)),
-              )),
-            ]),
-          ] else if (!compact &&
-              appt.status == AppointmentStatus.confirmed) ...[
-            const SizedBox(height: 12),
-            _infoBanner(
-                'Visit confirmed. Please arrive about 10 minutes early.',
-                AppColors.success,
-                Icons.check_circle_outline_rounded),
-          ] else if (appt.status == AppointmentStatus.checkedIn) ...[
-            const SizedBox(height: 12),
-            _infoBanner(
-                'You are checked in. Watch the queue for your turn.',
-                AppColors.info,
-                Icons.how_to_reg_rounded),
-          ] else if (appt.status == AppointmentStatus.inConsult) ...[
-            const SizedBox(height: 12),
-            _infoBanner('It is your turn now. Please see the doctor.',
-                AppColors.accent, Icons.campaign_rounded),
-          ] else if (appt.status == AppointmentStatus.completed &&
-              patient != null) ...[
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: () => _showReAppointmentSheet(patient, appt),
-                icon: const Icon(Icons.replay_rounded, size: 18),
-                label: const Text('Request re-appointment'),
-              ),
-            ),
-          ],
-          if (canCancel) ...[
-            const SizedBox(height: 10),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: () => _cancelAppointment(appt),
-                icon: const Icon(Icons.cancel_outlined, size: 18),
-                label: const Text('Cancel appointment'),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: AppColors.error,
-                  side: const BorderSide(color: AppColors.error),
+                    onPressed: () => _showReAppointmentSheet(patient, appt),
+                    icon: const Icon(Icons.replay_rounded, size: 18),
+                    label: const Text('Request re-appointment'),
+                  ),
                 ),
-              ),
-            ),
-          ],
-        ],
+              ],
+              if (canCancel) ...[
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    onPressed: () => _cancelAppointment(appt),
+                    icon: const Icon(Icons.cancel_outlined, size: 18),
+                    label: const Text('Cancel appointment'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppColors.error,
+                      side: const BorderSide(color: AppColors.error),
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -2317,120 +2602,703 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
   // -----------------------------------------------------------------
   // Billing
   // -----------------------------------------------------------------
-  Widget _billing() {
-    final async = ref.watch(patientInvoicesProvider);
+    Widget _billing(Map<String, dynamic> patient) {
+    final consultationAsync = ref.watch(patientBillingProvider);
+    final pharmacyAsync = ref.watch(patientPharmacyBillsProvider);
+
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Text('Billing & invoices', style: AppTextStyles.h1),
+      Text('Billing', style: AppTextStyles.h1),
       const SizedBox(height: 6),
-      Text('Review invoices and payment status from your clinic.',
+      Text('Consultation and pharmacy bills.',
           style: AppTextStyles.bodyMuted),
       const SizedBox(height: 18),
-      async.when(
-        loading: () => const Center(child: CircularProgressIndicator()),
-        error: (e, _) => _inlineError('Unable to load invoices: $e'),
-        data: (docs) {
-          if (docs.isEmpty) {
-            return _emptyCard(Icons.receipt_long_rounded, 'No invoices found',
-                'Invoices linked to your patient record will appear here.');
+
+      // ── Direct Refill / OTC Order Button ──
+      GlassCard(
+        borderColor: AppColors.primary.withOpacity(.4),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(14),
+          onTap: () => _openRefillOrder(patient),
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Row(children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: AppColors.primary.withOpacity(.12),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: const Icon(Icons.autorenew_rounded,
+                    color: AppColors.primary, size: 20),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Order your regular medicines',
+                        style: AppTextStyles.body
+                            .copyWith(fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 2),
+                    Text(
+                      'Quick refill of your current medications, '
+                      'or add OTC items and supplements.',
+                      style: AppTextStyles.caption,
+                    ),
+                  ],
+                ),
+              ),
+              const Icon(Icons.chevron_right_rounded,
+                  color: AppColors.textMuted),
+            ]),
+          ),
+        ),
+      ),
+      const SizedBox(height: 24),
+
+      // ── Pharmacy bills (prescriptionOrders) ──
+      pharmacyAsync.when(
+        loading: () => const Center(
+          child: Padding(
+            padding: EdgeInsets.all(20),
+            child: CircularProgressIndicator(),
+          ),
+        ),
+        error: (e, _) => _inlineError('Unable to load pharmacy bills: $e'),
+        data: (bills) {
+          if (bills.isEmpty) {
+            return const SizedBox.shrink();
           }
-          final due = docs
-              .where((d) => ![
-                    'paid',
-                    'completed',
-                    'settled'
-                  ].contains('${d.data()['status'] ?? ''}'.toLowerCase()))
-              .fold<num>(
-                  0,
-                  (sum, d) =>
-                      sum +
-                      ((d.data()['balanceDue'] ?? d.data()['amountDue'] ?? 0)
-                              is num
-                          ? (d.data()['balanceDue'] ??
-                              d.data()['amountDue'] ??
-                              0) as num
-                          : num.tryParse(
-                                  '${d.data()['balanceDue'] ?? d.data()['amountDue'] ?? 0}') ??
-                              0));
+          final billed = bills
+              .where((b) => b.status == PrescriptionOrderStatus.billed)
+              .fold<double>(0, (s, b) => s + (b.totalAmount ?? 0));
+          final pendingVerify = bills
+              .where((b) =>
+                  b.status == PrescriptionOrderStatus.paidPendingVerification)
+              .length;
+          final paid = bills
+              .where((b) => b.status == PrescriptionOrderStatus.paid)
+              .fold<double>(0, (s, b) => s + (b.totalAmount ?? 0));
+
           return Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SectionHeader(title: 'Pharmacy bills'),
+              const SizedBox(height: 8),
+              if (billed > 0 || pendingVerify > 0 || paid > 0)
                 GlassCard(
-                    child: Column(
+                  borderColor: (billed > 0
+                          ? AppColors.warning
+                          : AppColors.success)
+                      .withOpacity(.4),
+                  child: Row(children: [
+                    Icon(
+                      billed > 0
+                          ? Icons.pending_actions_rounded
+                          : Icons.check_circle_rounded,
+                      color: billed > 0
+                          ? AppColors.warning
+                          : AppColors.success,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                      Text('Outstanding balance',
-                          style: AppTextStyles.bodyMuted),
-                      const SizedBox(height: 7),
-                      Text(_money(due), style: AppTextStyles.h1)
-                    ])),
-                const SizedBox(height: 14),
-                ...docs.map((doc) {
-                  final d = doc.data();
-                  final status = (d['status'] ?? 'pending').toString();
-                  final paid = ['paid', 'completed', 'settled']
-                      .contains(status.toLowerCase());
-                  return Padding(
-                      padding: const EdgeInsets.only(bottom: 10),
-                      child: GlassCard(
-                          child: Row(children: [
-                        Container(
-                            width: 44,
-                            height: 44,
-                            decoration: BoxDecoration(
-                                color: (paid
-                                        ? AppColors.success
-                                        : AppColors.warning)
-                                    .withOpacity(.12),
-                                borderRadius: BorderRadius.circular(12)),
-                            child: Icon(Icons.receipt_long_rounded,
-                                color: paid
-                                    ? AppColors.success
-                                    : AppColors.warning)),
-                        const SizedBox(width: 12),
-                        Expanded(
-                            child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                              Text(
-                                  (d['invoiceNumber'] ??
-                                          d['invoiceId'] ??
-                                          doc.id)
-                                      .toString(),
-                                  style: AppTextStyles.body.copyWith(
-                                      fontWeight: FontWeight.w600)),
-                              const SizedBox(height: 4),
-                              Text(_dateLabel(_asDate(d['createdAt'])),
-                                  style: AppTextStyles.caption),
-                              Text(
-                                  _money(d['totalAmount'] ??
-                                      d['amount'] ??
-                                      d['amountDue']),
-                                  style: AppTextStyles.body)
-                            ])),
-                        Container(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 9, vertical: 5),
-                            decoration: BoxDecoration(
-                                color: (paid
-                                        ? AppColors.success
-                                        : AppColors.warning)
-                                    .withOpacity(.12),
-                                borderRadius: BorderRadius.circular(8)),
-                            child: Text(status,
-                                style: AppTextStyles.caption.copyWith(
-                                    color: paid
-                                        ? AppColors.success
-                                        : AppColors.warning))),
-                      ])));
-                }),
-              ]);
+                          if (billed > 0) ...[
+                            Text('Amount due',
+                                style: AppTextStyles.caption),
+                            Text(_money(billed),
+                                style: AppTextStyles.h2.copyWith(
+                                    color: AppColors.warning)),
+                          ] else
+                            Text('All pharmacy bills settled',
+                                style: AppTextStyles.body
+                                    .copyWith(color: AppColors.success)),
+                          if (pendingVerify > 0) ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              '$pendingVerify awaiting chemist verification',
+                              style: AppTextStyles.caption,
+                            ),
+                          ],
+                          if (paid > 0) ...[
+                            const SizedBox(height: 4),
+                            Text('${_money(paid)} paid',
+                                style: AppTextStyles.caption),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ]),
+                ),
+              const SizedBox(height: 10),
+              ...bills.map(_pharmacyBillRow),
+              const SizedBox(height: 24),
+            ],
+          );
+        },
+      ),
+
+      // ── Consultation fees ──
+      const SectionHeader(title: 'Consultation fees'),
+      const SizedBox(height: 8),
+      consultationAsync.when(
+        loading: () => const Center(
+          child: Padding(
+            padding: EdgeInsets.all(30),
+            child: CircularProgressIndicator(),
+          ),
+        ),
+        error: (e, _) => _inlineError('Unable to load billing: $e'),
+        data: (lines) {
+          if (lines.isEmpty) {
+            return _emptyCard(
+              Icons.receipt_long_rounded,
+              'No consultation fees',
+              'Consultation fees your doctor sets will appear here.',
+            );
+          }
+
+          final billed = lines.fold<double>(
+              0, (s, a) => s + (a.consultationFees ?? 0));
+          final paid = lines
+              .where((a) => a.paymentStatus == PaymentStatus.paid)
+              .fold<double>(0, (s, a) => s + (a.consultationFees ?? 0));
+          final due = lines
+              .where((a) => a.paymentStatus == PaymentStatus.unpaid)
+              .fold<double>(0, (s, a) => s + (a.consultationFees ?? 0));
+          final waived = lines
+              .where((a) => a.paymentStatus == PaymentStatus.waived)
+              .fold<double>(0, (s, a) => s + (a.consultationFees ?? 0));
+
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _billingTotalsCard(
+                billed: billed,
+                paid: paid,
+                due: due,
+                waived: waived,
+                count: lines.length,
+              ),
+              const SizedBox(height: 10),
+              ...lines.map(_billingRow),
+            ],
+          );
         },
       ),
     ]);
   }
 
+  void _openRefillOrder(Map<String, dynamic> patient) {
+    final rawMeds = patient['currentMedications'];
+    if (rawMeds is! List || rawMeds.isEmpty) {
+      _toast(
+        'You have no regular medicines saved. '
+        'You can still add OTC items inside the order screen.',
+        AppColors.info,
+      );
+    }
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => const PrescriptionOrderScreen(
+          appointment: null,
+          consultation: null,
+        ),
+      ),
+    );
+  }
+
+  Widget _pharmacyBillRow(PrescriptionOrderModel b) {
+     final color = switch (b.status) {
+      PrescriptionOrderStatus.billed => AppColors.warning,
+      PrescriptionOrderStatus.paidPendingVerification => AppColors.info,
+      PrescriptionOrderStatus.paid => AppColors.success,
+      PrescriptionOrderStatus.preparing => AppColors.info,
+      PrescriptionOrderStatus.outForDelivery => AppColors.info,
+      PrescriptionOrderStatus.delivered => AppColors.success,
+      _ => AppColors.textMuted,
+    };
+    final label = switch (b.status) {
+      PrescriptionOrderStatus.billed => 'Pay now',
+      PrescriptionOrderStatus.paidPendingVerification => 'Verifying',
+      PrescriptionOrderStatus.paid => 'Paid',
+      PrescriptionOrderStatus.preparing => 'Preparing',
+      PrescriptionOrderStatus.outForDelivery => 'Out for delivery',
+      PrescriptionOrderStatus.delivered => 'Delivered',
+      _ => '',
+    };
+    final canPay = b.status == PrescriptionOrderStatus.billed;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: GlassCard(
+        borderColor: color.withOpacity(.35),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: color.withOpacity(.12),
+                  borderRadius: BorderRadius.circular(11),
+                ),
+                child: Icon(Icons.local_pharmacy_rounded,
+                    color: color, size: 20),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(b.chemistName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: AppTextStyles.body
+                            .copyWith(fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 2),
+                    Text('#${b.orderNumber} · '
+                        '${DateFormat('dd MMM, hh:mm a').format(b.placedAt)}',
+                        style: AppTextStyles.caption),
+                  ],
+                ),
+              ),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(_money(b.totalAmount),
+                      style: AppTextStyles.body
+                          .copyWith(fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 4),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 8, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: color.withOpacity(.13),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Text(label,
+                        style:
+                            AppTextStyles.caption.copyWith(color: color)),
+                  ),
+                ],
+              ),
+            ]),
+
+            if (b.status != PrescriptionOrderStatus.billed) ...[
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => PatientOrderTrackingScreen(
+                        orderId: b.docId,
+                      ),
+                    ),
+                  ),
+                  icon: const Icon(Icons.receipt_long_rounded, size: 16),
+                  label: const Text('Track order'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: AppColors.info,
+                    side: const BorderSide(color: AppColors.info),
+                    minimumSize: const Size.fromHeight(40),
+                  ),
+                ),
+              ),
+            ],
+            if (canPay) ...[
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: () => _openPayPharmacyBill(context, b),
+                  icon: const Icon(Icons.payments_rounded, size: 16),
+                  label: Text(
+                      'Pay ₹${b.totalAmount?.toStringAsFixed(0) ?? '—'}'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppColors.success,
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size.fromHeight(44),
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openPayPharmacyBill(
+    BuildContext context, PrescriptionOrderModel order) async {
+  if (!mounted) return;
+
+  final utrCtrl = TextEditingController();
+  final db = FirebaseFirestore.instance;
+
+  ChemistModel? chemist;
+  try {
+    final snap =
+        await db.collection('chemists').doc(order.chemistDocId).get();
+    if (snap.exists) {
+      chemist = ChemistModel.fromMap(snap.id, snap.data()!);
+    }
+  } catch (_) {}
+  if (!mounted) {
+    utrCtrl.dispose();
+    return;
+  }
+
+  if (chemist == null) {
+    _toast('Chemist details not found.', AppColors.error);
+    utrCtrl.dispose();
+    return;
+  }
+
+  final upiUri = chemist.upiPaymentUri(
+    amount: order.totalAmount ?? 0,
+    orderNumber: order.orderNumber,
+  );
+
+  if (!context.mounted) {
+    utrCtrl.dispose();
+    return;
+  }
+
+  final submitted = await showDialog<bool>(
+    context: context,
+    barrierDismissible: false,
+    builder: (dctx) => AlertDialog(
+      backgroundColor: AppColors.surface,
+      title: Text(
+          'Pay ₹${order.totalAmount?.toStringAsFixed(0) ?? ''}',
+          style: AppTextStyles.h3),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Pay ${chemist!.name} via UPI, then paste the '
+              'transaction reference (UTR) below.',
+              style: AppTextStyles.bodyMuted,
+            ),
+            const SizedBox(height: 12),
+            if (chemist.upiId.isNotEmpty) ...[
+              Text('UPI ID', style: AppTextStyles.caption),
+              const SizedBox(height: 2),
+              SelectableText(chemist.upiId,
+                  style: AppTextStyles.body
+                      .copyWith(fontWeight: FontWeight.w600)),
+              const SizedBox(height: 10),
+            ],
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: upiUri == null
+                    ? null
+                    : () async {
+                        try {
+                          final ok = await launchUrl(upiUri,
+                              mode: LaunchMode.externalApplication);
+                          if (!ok && dctx.mounted) {
+                            ScaffoldMessenger.of(dctx).showSnackBar(
+                              const SnackBar(
+                                content: Text(
+                                    'Could not open a UPI app. '
+                                    'Pay manually via the UPI ID above.'),
+                                backgroundColor: AppColors.warning,
+                              ),
+                            );
+                          }
+                        } catch (e) {
+                          if (dctx.mounted) {
+                            ScaffoldMessenger.of(dctx).showSnackBar(
+                              SnackBar(
+                                content: Text('Could not open UPI app: $e'),
+                                backgroundColor: AppColors.error,
+                              ),
+                            );
+                          }
+                        }
+                      },
+                icon: const Icon(Icons.open_in_new_rounded, size: 16),
+                label: const Text('Open UPI app'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: AppColors.info,
+                  side: const BorderSide(color: AppColors.info),
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: utrCtrl,
+              textCapitalization: TextCapitalization.characters,
+              decoration: const InputDecoration(
+                labelText: 'UTR / transaction reference',
+                hintText: 'e.g. 1234567890ABCDEF',
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(dctx, false),
+            child: const Text('Cancel')),
+        ElevatedButton(
+          onPressed: () {
+            if (utrCtrl.text.trim().length < 6) return;
+            Navigator.pop(dctx, true);
+          },
+          child: const Text('Generate receipt'),
+        ),
+      ],
+    ),
+  );
+
+  if (!mounted) {
+    utrCtrl.dispose();
+    return;
+  }
+  if (submitted != true) {
+    utrCtrl.dispose();
+    return;
+  }
+
+  final utr = utrCtrl.text.trim();
+  utrCtrl.dispose();
+
+  try {
+    await ref
+        .read(chemistServiceProvider)
+        .submitUpiReference(orderId: order.docId, utr: utr);
+    if (!mounted) return;
+    _toast('Payment submitted. Chemist will verify shortly.',
+        AppColors.success);
+  } catch (e) {
+    if (!mounted) return;
+    _toast('Could not submit payment: $e', AppColors.error);
+  }
+}
+
+
+  Widget _billingTotalsCard({
+    required double billed,
+    required double paid,
+    required double due,
+    required double waived,
+    required int count,
+  }) {
+    final settled = due == 0;
+    return GlassCard(
+      borderColor:
+          (settled ? AppColors.success : AppColors.warning).withOpacity(.4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: AppColors.success.withOpacity(.12),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Icon(Icons.receipt_long_rounded,
+                  color: AppColors.success, size: 20),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Total billed', style: AppTextStyles.caption),
+                  const SizedBox(height: 2),
+                  Text(_money(billed), style: AppTextStyles.h1),
+                ],
+              ),
+            ),
+            Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: (settled ? AppColors.success : AppColors.warning)
+                    .withOpacity(.13),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                settled ? 'Settled' : 'Due ${_money(due)}',
+                style: AppTextStyles.caption.copyWith(
+                    color: settled ? AppColors.success : AppColors.warning,
+                    fontWeight: FontWeight.w600),
+              ),
+            ),
+          ]),
+          const SizedBox(height: 14),
+          Row(children: [
+            Expanded(
+                child: _billingMini(
+                    'Paid', _money(paid), AppColors.success)),
+            const SizedBox(width: 8),
+            Expanded(
+                child: _billingMini(
+                    'Due', _money(due), AppColors.warning)),
+            if (waived > 0) ...[
+              const SizedBox(width: 8),
+              Expanded(
+                  child: _billingMini(
+                      'Waived', _money(waived), AppColors.info)),
+            ],
+          ]),
+          const SizedBox(height: 10),
+          Text(
+            '$count consultation${count == 1 ? '' : 's'} billed',
+            style: AppTextStyles.caption,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _billingMini(String label, String amount, Color color) =>
+      Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        decoration: BoxDecoration(
+          color: color.withOpacity(.10),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: color.withOpacity(.25)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(label,
+                style: AppTextStyles.caption.copyWith(color: color)),
+            const SizedBox(height: 3),
+            Text(amount,
+                style: AppTextStyles.body.copyWith(
+                    fontWeight: FontWeight.w700, color: color)),
+          ],
+        ),
+      );
+
+  Widget _billingRow(AppointmentModel a) {
+    final status = a.paymentStatus;
+    final color = switch (status) {
+      PaymentStatus.paid => AppColors.success,
+      PaymentStatus.waived => AppColors.info,
+      PaymentStatus.unpaid => AppColors.warning,
+    };
+    final label = switch (status) {
+      PaymentStatus.paid => 'Paid',
+      PaymentStatus.waived => 'Waived',
+      PaymentStatus.unpaid => 'Due',
+    };
+    final date = a.consultEndedAt ?? a.slot;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: GlassCard(
+        borderColor: color.withOpacity(.35),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: color.withOpacity(.12),
+                  borderRadius: BorderRadius.circular(11),
+                ),
+                child: Icon(
+                  status == PaymentStatus.unpaid
+                      ? Icons.schedule_rounded
+                      : status == PaymentStatus.waived
+                          ? Icons.remove_circle_outline_rounded
+                          : Icons.check_circle_rounded,
+                  color: color,
+                  size: 20,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Dr. ${a.doctorName}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: AppTextStyles.body
+                            .copyWith(fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 2),
+                    Text(
+                      DateFormat('EEE, dd MMM yyyy • hh:mm a').format(date),
+                      style: AppTextStyles.caption,
+                    ),
+                  ],
+                ),
+              ),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(_money(a.consultationFees),
+                      style: AppTextStyles.body
+                          .copyWith(fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 4),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 8, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: color.withOpacity(.13),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Text(label,
+                        style:
+                            AppTextStyles.caption.copyWith(color: color)),
+                  ),
+                ],
+              ),
+            ]),
+            const SizedBox(height: 8),
+            Row(children: [
+              _tinyBillingFact(
+                  Icons.confirmation_number_rounded,
+                  a.tokenNumber > 0 ? a.tokenLabel : 'No token'),
+              const SizedBox(width: 14),
+              _tinyBillingFact(
+                  Icons.medical_services_rounded, a.statusLabel),
+              if (status == PaymentStatus.unpaid) ...[
+                const Spacer(),
+                Text('Pay at clinic',
+                    style: AppTextStyles.caption
+                        .copyWith(color: AppColors.warning)),
+              ],
+            ]),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _tinyBillingFact(IconData icon, String label) => Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 13, color: AppColors.textMuted),
+          const SizedBox(width: 5),
+          Text(label, style: AppTextStyles.caption),
+        ],
+      );
+
   // -----------------------------------------------------------------
-  // Profile
+  // Profile (with new Account & privacy entry)
   // -----------------------------------------------------------------
   Widget _profile(Map<String, dynamic> patient) =>
       Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -2475,6 +3343,46 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
             'Your patient ID and authentication identity are managed by the clinic and cannot be changed here.',
             AppColors.info,
             Icons.shield_outlined),
+        const SizedBox(height: 14),
+        GlassCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(children: [
+                const Icon(Icons.manage_accounts_rounded,
+                    color: AppColors.patientAccent),
+                const SizedBox(width: 9),
+                Text('Account & privacy', style: AppTextStyles.h3),
+              ]),
+              const SizedBox(height: 10),
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.shield_rounded,
+                    color: AppColors.info),
+                title: const Text('Privacy & security settings'),
+                subtitle: const Text(
+                    'Manage consent, 2-step verification and session security.'),
+                trailing: const Icon(Icons.chevron_right_rounded),
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => const _PrivacySecurityScreen(),
+                  ),
+                ),
+              ),
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.download_rounded,
+                    color: AppColors.success),
+                title: const Text('Download my data'),
+                subtitle: const Text(
+                    'Request a copy of your personal data (DPDP §11).'),
+                trailing: const Icon(Icons.chevron_right_rounded),
+                onTap: () => _requestDataExport(patient),
+              ),
+            ],
+          ),
+        ),
       ]);
 
   Widget _profileRow(IconData icon, String label, dynamic value) => Padding(
@@ -2495,11 +3403,16 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
       );
 
   Future<void> _editProfile(Map<String, dynamic> patient) async {
-    final name = TextEditingController(text: '${patient['fullName'] ?? ''}');
-    final phone = TextEditingController(text: '${patient['phone'] ?? ''}');
-    final address = TextEditingController(text: '${patient['address'] ?? ''}');
-    final city = TextEditingController(text: '${patient['city'] ?? ''}');
-    final result = await showDialog<bool>(
+  final name = TextEditingController(text: '${patient['fullName'] ?? ''}');
+  final phone = TextEditingController(text: '${patient['phone'] ?? ''}');
+  final address = TextEditingController(text: '${patient['address'] ?? ''}');
+  final city = TextEditingController(text: '${patient['city'] ?? ''}');
+
+  bool? result;
+  String? newName, newPhone, newAddress, newCity;
+
+  try {
+    result = await showDialog<bool>(
         context: context,
         builder: (dialogContext) => AlertDialog(
               title: const Text('Edit contact details'),
@@ -2528,28 +3441,554 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
                     child: const Text('Save'))
               ],
             ));
+
+    // Snapshot values before disposing the controllers.
     if (result == true) {
-      try {
-        await FirebaseFirestore.instance
-            .collection('patients')
-            .doc(patient['patientDocId'])
-            .update({
-          'fullName': name.text.trim(),
-          'phone': phone.text.trim(),
-          'address': address.text.trim(),
-          'city': city.text.trim(),
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
-        ref.invalidate(currentPatientProvider);
-        if (mounted) _toast('Profile updated.', AppColors.success);
-      } catch (e) {
-        if (mounted) _toast('Could not update profile: $e', AppColors.error);
-      }
+      newName = name.text.trim();
+      newPhone = phone.text.trim();
+      newAddress = address.text.trim();
+      newCity = city.text.trim();
     }
+  } finally {
+    // Let the dialog's exit animation finish (~150–200 ms) so its
+    // TextFields fully unmount before the controllers are disposed.
+    await Future.delayed(const Duration(milliseconds: 400));
     name.dispose();
     phone.dispose();
     address.dispose();
     city.dispose();
+  }
+
+  if (result != true || newName == null) return;
+
+  try {
+    await FirebaseFirestore.instance
+        .collection('patients')
+        .doc(patient['patientDocId'])
+        .update({
+      'fullName': newName,
+      'phone': newPhone,
+      'address': newAddress,
+      'city': newCity,
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
+    ref.invalidate(currentPatientProvider);
+    if (mounted) _toast('Profile updated.', AppColors.success);
+  } catch (e) {
+    if (mounted) _toast('Could not update profile: $e', AppColors.error);
+  }
+}
+
+  // -----------------------------------------------------------------
+  // Privacy & security (tab)
+  // -----------------------------------------------------------------
+  Widget _privacyAndSecurity(Map<String, dynamic> patient) {
+  final consentAsync = ref.watch(patientConsentProvider);
+  final securityAsync = ref.watch(patientSecurityPrefsProvider);
+
+  return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+    Text('Privacy & security', style: AppTextStyles.h1),
+    const SizedBox(height: 6),
+    Text('Control how your data is used and how your account is protected.',
+        style: AppTextStyles.bodyMuted),
+    const SizedBox(height: 18),
+
+    // ---- Consent summary ----
+    consentAsync.when(
+      loading: () => const Center(child: CircularProgressIndicator()),
+      error: (e, _) => _inlineError('Could not load consent status: $e'),
+      data: (consent) {
+        final purposes =
+            consent?['consent_accepted_purposes'] as List<String>? ??
+                const <String>[];
+        final version = consent?['consent_version'] as String? ?? '—';
+        final isMinor = consent?['is_minor'] == true;
+        final guardianName = consent?['guardian_name'] as String?;
+        final guardianRel =
+            (consent?['guardian_relationship'] as String?) ?? 'guardian';
+
+        return GlassCard(
+          borderColor: AppColors.patientAccent.withOpacity(.4),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(children: [
+                const Icon(Icons.verified_user_rounded,
+                    color: AppColors.patientAccent),
+                const SizedBox(width: 9),
+                Expanded(
+                    child: Text('Consent', style: AppTextStyles.h3)),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 9, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: AppColors.success.withOpacity(.13),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Text('Active v$version',
+                      style: AppTextStyles.caption
+                          .copyWith(color: AppColors.success)),
+                ),
+              ]),
+              const SizedBox(height: 10),
+              Text(
+                'You have given consent for the following purposes:',
+                style: AppTextStyles.bodyMuted,
+              ),
+              const SizedBox(height: 8),
+              ..._purposeRows(purposes, isMinor: isMinor),
+              if (isMinor && guardianName != null) ...[
+                const SizedBox(height: 10),
+                _infoBanner(
+                  'Consent given by $guardianName ($guardianRel).',
+                  AppColors.info,
+                  Icons.family_restroom,
+                ),
+              ],
+              const SizedBox(height: 14),
+              Row(children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () =>
+                        _openConsentManagement(patient, consent),
+                    icon: const Icon(Icons.tune_rounded, size: 18),
+                    label: const Text('Manage consent'),
+                  ),
+                ),
+              ]),
+            ],
+          ),
+        );
+      },
+    ),
+
+    const SizedBox(height: 14),
+
+    // ---- Security ----
+    securityAsync.when(
+      loading: () => const SizedBox.shrink(),
+      error: (_, __) => const SizedBox.shrink(),
+      data: (prefs) => GlassCard(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              const Icon(Icons.lock_rounded, color: AppColors.info),
+              const SizedBox(width: 9),
+              Expanded(
+                  child: Text('Account security',
+                      style: AppTextStyles.h3)),
+            ]),
+            const SizedBox(height: 8),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              secondary: const Icon(Icons.password_rounded,
+                  color: AppColors.textMuted),
+              title: const Text('2-step verification'),
+              subtitle: const Text(
+                  'Require an OTP in addition to your password at sign-in.'),
+              value: prefs['twoFactorEnabled'] == true,
+              onChanged: (v) => _toggleTwoFactor(v),
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              secondary: const Icon(Icons.fingerprint_rounded,
+                  color: AppColors.textMuted),
+              title: const Text('Biometric app lock'),
+              subtitle: const Text(
+                  'Ask for fingerprint or face unlock when opening the app.'),
+              value: prefs['biometricLockEnabled'] == true,
+              onChanged: (v) => _toggleBiometricLock(v),
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.timer_outlined,
+                  color: AppColors.textMuted),
+              title: const Text('Auto sign-out'),
+              subtitle: Text(
+                _autoSignOutLabel(
+                    prefs['autoSignOutMinutes'] as int? ?? 15),
+              ),
+              trailing: const Icon(Icons.chevron_right_rounded),
+              onTap: () => _pickAutoSignOut(
+                  prefs['autoSignOutMinutes'] as int? ?? 15),
+            ),
+          ],
+        ),
+      ),
+    ),
+
+    const SizedBox(height: 14),
+
+    // ---- Data rights ----
+    GlassCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            const Icon(Icons.gavel_rounded, color: AppColors.warning),
+            const SizedBox(width: 9),
+            Expanded(
+                child: Text('Your data rights',
+                    style: AppTextStyles.h3)),
+          ]),
+          const SizedBox(height: 8),
+          _dataRightTile(
+            icon: Icons.download_rounded,
+            color: AppColors.success,
+            title: 'Download my data',
+            subtitle: 'Export your data in a machine-readable format.',
+            onTap: () => _requestDataExport(patient),
+          ),
+          _dataRightTile(
+            icon: Icons.fact_check_rounded,
+            color: AppColors.info,
+            title: 'Correct my information',
+            subtitle: 'Request a correction to your profile details.',
+            onTap: () =>
+                setState(() => _selectedTabLabel = 'Profile'),
+          ),
+          _dataRightTile(
+            icon: Icons.delete_forever_rounded,
+            color: AppColors.error,
+            title: 'Request account erasure',
+            subtitle:
+                'Ask the clinic to delete your data (medical records kept '
+                'as required by law).',
+            onTap: () => _confirmErasureRequest(patient),
+          ),
+        ],
+      ),
+    ),
+
+    const SizedBox(height: 14),
+    _infoBanner(
+      'Your clinic is the Data Fiduciary for your health data. This app '
+      'processes it on the clinic\'s instructions. For complaints, contact '
+      'the clinic\'s Grievance Officer, or escalate to the Data Protection '
+      'Board of India.',
+      AppColors.info,
+      Icons.policy_rounded,
+    ),
+  ]);
+}
+
+  List<Widget> _purposeRows(List<String> purposes, {required bool isMinor}) {
+    String label(String id) => switch (id) {
+          'purpose_1' => 'Clinical care',
+          'purpose_2' => 'Appointments & communication',
+          'purpose_3' => 'Billing',
+          'purpose_4' => 'Health reminders & updates',
+          'purpose_5' => 'De-identified analytics for pharma',
+          _ => id,
+        };
+
+    IconData icon(String id) => switch (id) {
+          'purpose_1' => Icons.medical_services_rounded,
+          'purpose_2' => Icons.event_note_rounded,
+          'purpose_3' => Icons.receipt_long_rounded,
+          'purpose_4' => Icons.notifications_active_rounded,
+          'purpose_5' => Icons.analytics_rounded,
+          _ => Icons.check_rounded,
+        };
+
+    if (purposes.isEmpty) {
+      return [
+        Text('No purposes recorded.', style: AppTextStyles.caption),
+      ];
+    }
+
+    return purposes.map((p) {
+      final isCommercial = p == 'purpose_5';
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Row(children: [
+          Icon(icon(p),
+              size: 16,
+              color: isCommercial
+                  ? AppColors.info
+                  : AppColors.patientAccent),
+          const SizedBox(width: 9),
+          Expanded(child: Text(label(p), style: AppTextStyles.body)),
+          if (isCommercial)
+            Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: AppColors.info.withOpacity(.13),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: Text('COMMERCIAL',
+                  style: AppTextStyles.caption.copyWith(
+                    color: AppColors.info,
+                    fontSize: 9,
+                    fontWeight: FontWeight.w700,
+                  )),
+            ),
+        ]),
+      );
+    }).toList();
+  }
+
+  String _autoSignOutLabel(int minutes) {
+    if (minutes < 60) return 'After $minutes minutes of inactivity';
+    final h = minutes ~/ 60;
+    return 'After $h hour${h == 1 ? '' : 's'} of inactivity';
+  }
+
+  Widget _dataRightTile({
+    required IconData icon,
+    required Color color,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+  }) =>
+      ListTile(
+        contentPadding: EdgeInsets.zero,
+        leading: Icon(icon, color: color),
+        title: Text(title),
+        subtitle: Text(subtitle, style: AppTextStyles.caption),
+        trailing: const Icon(Icons.chevron_right_rounded),
+        onTap: onTap,
+      );
+
+  Future<void> _openConsentManagement(
+    Map<String, dynamic> patient,
+    Map<String, dynamic>? consent,
+  ) async {
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+      builder: (_) => _ConsentManagementSheet(
+        patient: patient,
+        currentConsent: consent,
+      ),
+    );
+    ref.invalidate(patientConsentProvider);
+  }
+
+  Future<void> _requestDataExport(Map<String, dynamic> patient) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Text('Download my data', style: AppTextStyles.h3),
+        content: const Text(
+          'We will prepare a copy of your personal data and email you a '
+          'secure download link within 30 days, as required under the DPDP '
+          'Act. Do you want to proceed?',
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dctx, false),
+              child: const Text('Cancel')),
+          ElevatedButton(
+              onPressed: () => Navigator.pop(dctx, true),
+              child: const Text('Request export')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    try {
+      final uid = FirebaseAuth.instance.currentUser?.uid;
+      if (uid == null) throw 'Not signed in';
+
+      await FirebaseFirestore.instance
+          .collection('dataRequests')
+          .add({
+        'type': 'export',
+        'userId': uid,
+        'userEmail': FirebaseAuth.instance.currentUser?.email,
+        'patientDocId': patient['patientDocId'],
+        'clinicId': patient['clinicId'],
+        'status': 'pending',
+        'requestedAt': FieldValue.serverTimestamp(),
+      });
+
+      if (!mounted) return;
+      _toast(
+          'Export requested. You will receive an email within 30 days.',
+          AppColors.success);
+    } catch (e) {
+      if (!mounted) return;
+      _toast('Could not submit request: $e', AppColors.error);
+    }
+  }
+
+  Future<void> _confirmErasureRequest(Map<String, dynamic> patient) async {
+    final reasonCtrl = TextEditingController();
+    final confirmed = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+      builder: (sheetCtx) => Padding(
+        padding: EdgeInsets.fromLTRB(
+            20, 22, 20, MediaQuery.of(sheetCtx).viewInsets.bottom + 22),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(children: [
+                const Icon(Icons.delete_forever_rounded,
+                    color: AppColors.error),
+                const SizedBox(width: 10),
+                Text('Request account erasure',
+                    style: AppTextStyles.h3),
+              ]),
+              const SizedBox(height: 10),
+              Text(
+                'You can ask the clinic to erase your personal data. '
+                'However, your medical records must be retained for the '
+                'period required by Indian medical record rules. '
+                'Clinical data will be kept, but your account and marketing '
+                'consents will be removed.',
+                style: AppTextStyles.bodyMuted,
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: reasonCtrl,
+                maxLines: 2,
+                decoration: const InputDecoration(
+                    labelText: 'Reason (optional)'),
+              ),
+              const SizedBox(height: 18),
+              Row(children: [
+                Expanded(
+                    child: OutlinedButton(
+                        onPressed: () =>
+                            Navigator.pop(sheetCtx, false),
+                        child: const Text('Cancel'))),
+                const SizedBox(width: 10),
+                Expanded(
+                    child: ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                      backgroundColor: AppColors.error,
+                      foregroundColor: Colors.white),
+                  onPressed: () => Navigator.pop(sheetCtx, true),
+                  child: const Text('Submit request'),
+                )),
+              ]),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    if (confirmed != true) {
+      reasonCtrl.dispose();
+      return;
+    }
+
+    try {
+      final uid = FirebaseAuth.instance.currentUser?.uid;
+      if (uid == null) throw 'Not signed in';
+      await FirebaseFirestore.instance.collection('dataRequests').add({
+        'type': 'erasure',
+        'userId': uid,
+        'userEmail': FirebaseAuth.instance.currentUser?.email,
+        'patientDocId': patient['patientDocId'],
+        'clinicId': patient['clinicId'],
+        'reason': reasonCtrl.text.trim(),
+        'status': 'pending',
+        'requestedAt': FieldValue.serverTimestamp(),
+      });
+      if (!mounted) return;
+      _toast('Erasure request submitted to your clinic.', AppColors.success);
+    } catch (e) {
+      if (!mounted) return;
+      _toast('Could not submit request: $e', AppColors.error);
+    } finally {
+      reasonCtrl.dispose();
+    }
+  }
+
+  Future<void> _writeSecurityPref(String key, dynamic value) async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+    try {
+      await FirebaseFirestore.instance
+          .collection('users')
+          .doc(uid)
+          .set({
+        'security': {key: value},
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+    } catch (e) {
+      if (mounted) _toast('Could not save setting: $e', AppColors.error);
+    }
+  }
+
+  Future<void> _toggleTwoFactor(bool enabled) async {
+    if (enabled) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (dctx) => AlertDialog(
+          backgroundColor: AppColors.surface,
+          title: Text('Enable 2-step verification',
+              style: AppTextStyles.h3),
+          content: const Text(
+              'We will send a one-time code to your registered phone each '
+              'time you sign in. Continue?'),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(dctx, false),
+                child: const Text('Cancel')),
+            ElevatedButton(
+                onPressed: () => Navigator.pop(dctx, true),
+                child: const Text('Enable')),
+          ],
+        ),
+      );
+      if (ok != true) return;
+    }
+    await _writeSecurityPref('twoFactorEnabled', enabled);
+    if (mounted) {
+      _toast(
+          enabled ? '2-step verification enabled.' : '2-step verification disabled.',
+          enabled ? AppColors.success : AppColors.info);
+    }
+  }
+
+  Future<void> _toggleBiometricLock(bool enabled) async {
+    await _writeSecurityPref('biometricLockEnabled', enabled);
+    if (mounted) {
+      _toast(
+          enabled ? 'Biometric lock enabled.' : 'Biometric lock disabled.',
+          enabled ? AppColors.success : AppColors.info);
+    }
+  }
+
+  Future<void> _pickAutoSignOut(int current) async {
+    final options = <int>[5, 15, 30, 60, 120];
+    final picked = await showDialog<int>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Text('Auto sign-out', style: AppTextStyles.h3),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: options
+              .map((m) => RadioListTile<int>(
+                    value: m,
+                    groupValue: current,
+                    title: Text(_autoSignOutLabel(m)),
+                    onChanged: (v) => Navigator.pop(dctx, v),
+                  ))
+              .toList(),
+        ),
+      ),
+    );
+    if (picked == null) return;
+    await _writeSecurityPref('autoSignOutMinutes', picked);
+    if (mounted) _toast('Auto sign-out updated.', AppColors.success);
   }
 
   Widget _recentActivity(AsyncValue<List<AppointmentModel>> async) {
@@ -2689,6 +4128,1104 @@ class _PatientDashboardState extends ConsumerState<PatientDashboard> {
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(message), backgroundColor: color));
   }
+}
+
+// ============================================================================
+// Standalone Privacy & security screen (pushed from Profile)
+// ============================================================================
+class _PrivacySecurityScreen extends ConsumerWidget {
+  const _PrivacySecurityScreen();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return Scaffold(
+      backgroundColor: AppColors.background,
+      appBar: AppBar(
+        backgroundColor: AppColors.surface,
+        elevation: 0,
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back_rounded,
+              color: AppColors.textPrimary),
+          onPressed: () => Navigator.pop(context),
+        ),
+        title: Text('Privacy & security', style: AppTextStyles.h3),
+      ),
+      body: SafeArea(
+        child: _PrivacySecurityBody(),
+      ),
+    );
+  }
+}
+
+class _PrivacySecurityBody extends ConsumerWidget {
+  const _PrivacySecurityBody();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final consentAsync = ref.watch(patientConsentProvider);
+    final securityAsync = ref.watch(patientSecurityPrefsProvider);
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 28),
+      children: [
+        consentAsync.when(
+          loading: () => const Center(child: CircularProgressIndicator()),
+          error: (e, _) => Text('Could not load consent: $e'),
+          data: (consent) => _ConsentCard(consent: consent),
+        ),
+        const SizedBox(height: 14),
+        securityAsync.when(
+          loading: () => const SizedBox.shrink(),
+          error: (_, __) => const SizedBox.shrink(),
+          data: (prefs) => _SecurityCard(prefs: prefs),
+        ),
+      ],
+    );
+  }
+}
+
+class _ConsentCard extends ConsumerWidget {
+  final Map<String, dynamic>? consent;
+  const _ConsentCard({required this.consent});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final purposes =
+        consent?['consent_accepted_purposes'] as List<String>? ??
+            const <String>[];
+    final version = consent?['consent_version'] as String? ?? '—';
+    final isMinor = consent?['is_minor'] == true;
+
+    // Hoisted here — NOT inside the widget tree.
+    final guardianName = consent?['guardian_name'] as String?;
+    final guardianRel =
+        (consent?['guardian_relationship'] as String?) ?? 'guardian';
+
+    return GlassCard(
+      borderColor: AppColors.patientAccent.withOpacity(.4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            const Icon(Icons.verified_user_rounded,
+                color: AppColors.patientAccent),
+            const SizedBox(width: 9),
+            Expanded(child: Text('Consent', style: AppTextStyles.h3)),
+            Container(
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 9, vertical: 4),
+              decoration: BoxDecoration(
+                color: AppColors.success.withOpacity(.13),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Text('Active v$version',
+                  style: AppTextStyles.caption
+                      .copyWith(color: AppColors.success)),
+            ),
+          ]),
+          const SizedBox(height: 10),
+          Text(
+            'You have given consent for the following purposes:',
+            style: AppTextStyles.bodyMuted,
+          ),
+          const SizedBox(height: 8),
+          if (purposes.isEmpty)
+            Text('No purposes recorded.', style: AppTextStyles.caption)
+          else
+            ...purposes.map((p) {
+              final isCommercial = p == 'purpose_5';
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Row(children: [
+                  Icon(
+                    switch (p) {
+                      'purpose_1' => Icons.medical_services_rounded,
+                      'purpose_2' => Icons.event_note_rounded,
+                      'purpose_3' => Icons.receipt_long_rounded,
+                      'purpose_4' => Icons.notifications_active_rounded,
+                      'purpose_5' => Icons.analytics_rounded,
+                      _ => Icons.check_rounded,
+                    },
+                    size: 16,
+                    color: isCommercial
+                        ? AppColors.info
+                        : AppColors.patientAccent,
+                  ),
+                  const SizedBox(width: 9),
+                  Expanded(
+                      child: Text(
+                    switch (p) {
+                      'purpose_1' => 'Clinical care',
+                      'purpose_2' => 'Appointments & communication',
+                      'purpose_3' => 'Billing',
+                      'purpose_4' => 'Health reminders & updates',
+                      'purpose_5' => 'De-identified analytics for pharma',
+                      _ => p,
+                    },
+                    style: AppTextStyles.body,
+                  )),
+                  if (isCommercial)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: AppColors.info.withOpacity(.13),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text('COMMERCIAL',
+                          style: AppTextStyles.caption.copyWith(
+                            color: AppColors.info,
+                            fontSize: 9,
+                            fontWeight: FontWeight.w700,
+                          )),
+                    ),
+                ]),
+              );
+            }),
+          if (isMinor && guardianName != null) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: AppColors.info.withOpacity(.09),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Row(children: [
+                const Icon(Icons.family_restroom,
+                    color: AppColors.info, size: 16),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Consent given by $guardianName ($guardianRel).',
+                    style: AppTextStyles.caption
+                        .copyWith(color: AppColors.info),
+                  ),
+                ),
+              ]),
+            ),
+          ],
+          const SizedBox(height: 14),
+          Row(children: [
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: () => showModalBottomSheet(
+                  context: context,
+                  isScrollControlled: true,
+                  useSafeArea: true,
+                  backgroundColor: AppColors.surface,
+                  shape: const RoundedRectangleBorder(
+                      borderRadius:
+                          BorderRadius.vertical(top: Radius.circular(24))),
+                  builder: (_) => _ConsentManagementSheet(
+                    patient: const {'fullName': ''},
+                    currentConsent: consent,
+                  ),
+                ),
+                icon: const Icon(Icons.tune_rounded, size: 18),
+                label: const Text('Manage consent'),
+              ),
+            ),
+          ]),
+        ],
+      ),
+    );
+  }
+}
+
+class _SecurityCard extends ConsumerWidget {
+  final Map<String, dynamic> prefs;
+  const _SecurityCard({required this.prefs});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return GlassCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            const Icon(Icons.lock_rounded, color: AppColors.info),
+            const SizedBox(width: 9),
+            Expanded(
+                child: Text('Account security', style: AppTextStyles.h3)),
+          ]),
+          const SizedBox(height: 8),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            secondary: const Icon(Icons.password_rounded,
+                color: AppColors.textMuted),
+            title: const Text('2-step verification'),
+            subtitle: const Text(
+                'Require an OTP in addition to your password at sign-in.'),
+            value: prefs['twoFactorEnabled'] == true,
+            onChanged: (v) => _writeSecurityPref(context, 'twoFactorEnabled', v),
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            secondary: const Icon(Icons.fingerprint_rounded,
+                color: AppColors.textMuted),
+            title: const Text('Biometric app lock'),
+            subtitle: const Text(
+                'Ask for fingerprint or face unlock when opening the app.'),
+            value: prefs['biometricLockEnabled'] == true,
+            onChanged: (v) =>
+                _writeSecurityPref(context, 'biometricLockEnabled', v),
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading:
+                const Icon(Icons.timer_outlined, color: AppColors.textMuted),
+            title: const Text('Auto sign-out'),
+            subtitle: Text(
+              _autoSignOutLabel(prefs['autoSignOutMinutes'] as int? ?? 15),
+            ),
+            trailing: const Icon(Icons.chevron_right_rounded),
+            onTap: () =>
+                _pickAutoSignOut(context, prefs['autoSignOutMinutes'] as int? ?? 15),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _writeSecurityPref(
+      BuildContext context, String key, dynamic value) async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+    try {
+      await FirebaseFirestore.instance.collection('users').doc(uid).set({
+        'security': {key: value},
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Could not save: $e'),
+                backgroundColor: AppColors.error));
+      }
+    }
+  }
+
+  String _autoSignOutLabel(int minutes) {
+    if (minutes < 60) return 'After $minutes minutes of inactivity';
+    final h = minutes ~/ 60;
+    return 'After $h hour${h == 1 ? '' : 's'} of inactivity';
+  }
+
+  Future<void> _pickAutoSignOut(BuildContext context, int current) async {
+    final options = <int>[5, 15, 30, 60, 120];
+    final picked = await showDialog<int>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Text('Auto sign-out', style: AppTextStyles.h3),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: options
+              .map((m) => RadioListTile<int>(
+                    value: m,
+                    groupValue: current,
+                    title: Text(_autoSignOutLabel(m)),
+                    onChanged: (v) => Navigator.pop(dctx, v),
+                  ))
+              .toList(),
+        ),
+      ),
+    );
+    if (picked == null) return;
+    await _writeSecurityPref(context, 'autoSignOutMinutes', picked);
+  }
+}
+
+// ============================================================================
+// Consent management sheet — withdraw / re-grant purposes
+// ============================================================================
+class _ConsentManagementSheet extends ConsumerStatefulWidget {
+  final Map<String, dynamic> patient;
+  final Map<String, dynamic>? currentConsent;
+
+  const _ConsentManagementSheet({
+    required this.patient,
+    required this.currentConsent,
+  });
+
+  @override
+  ConsumerState<_ConsentManagementSheet> createState() =>
+      _ConsentManagementSheetState();
+}
+
+class _ConsentManagementSheetState
+    extends ConsumerState<_ConsentManagementSheet> {
+  bool _saving = false;
+  late Set<String> _selected;
+
+  static const _purposes =
+      <String, ({String title, String subtitle, bool required})>{
+    'purpose_1': (
+      title: 'Clinical care',
+      subtitle: 'Your doctor uses this to treat you. Required.',
+      required: true,
+    ),
+    'purpose_2': (
+      title: 'Appointments & communication',
+      subtitle: 'Reminders and confirmations by SMS, email or WhatsApp.',
+      required: false,
+    ),
+    'purpose_3': (
+      title: 'Billing',
+      subtitle: 'Processing payments and keeping billing records.',
+      required: false,
+    ),
+    'purpose_4': (
+      title: 'Health reminders & updates',
+      subtitle: 'General health tips and preventive care reminders.',
+      required: false,
+    ),
+    'purpose_5': (
+      title: 'De-identified analytics for pharma',
+      subtitle:
+          'Aggregated research reports. This is a commercial use. '
+          'Your name and contact details are never shared.',
+      required: false,
+    ),
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    final accepted = (widget.currentConsent?['consent_accepted_purposes']
+                as List?)
+            ?.cast<String>()
+            .toSet() ??
+        <String>{};
+    _selected = accepted;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isMinor = widget.currentConsent?['is_minor'] == true;
+
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+          20, 22, 20, MediaQuery.of(context).viewInsets.bottom + 22),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              const Icon(Icons.tune_rounded, color: AppColors.patientAccent),
+              const SizedBox(width: 10),
+              Expanded(
+                  child:
+                      Text('Manage consent', style: AppTextStyles.h3)),
+            ]),
+            const SizedBox(height: 6),
+            Text(
+              'You can change your choices at any time. Toggling off an '
+              'optional purpose will not affect your treatment.',
+              style: AppTextStyles.bodyMuted,
+            ),
+            const SizedBox(height: 16),
+
+            ..._purposes.entries.map((e) {
+              if (isMinor &&
+                  (e.key == 'purpose_4' || e.key == 'purpose_5')) {
+                return const SizedBox.shrink();
+              }
+              final meta = e.value;
+              final checked = _selected.contains(e.key);
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 4, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: checked
+                        ? AppColors.patientAccent.withOpacity(.06)
+                        : AppColors.surface,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: checked
+                          ? AppColors.patientAccent
+                          : AppColors.cardBorder,
+                    ),
+                  ),
+                  child: SwitchListTile(
+                    contentPadding:
+                        const EdgeInsets.symmetric(horizontal: 6),
+                    value: checked,
+                    onChanged: meta.required
+                        ? null
+                        : (v) => setState(() {
+                              if (v) {
+                                _selected.add(e.key);
+                              } else {
+                                _selected.remove(e.key);
+                              }
+                            }),
+                    title: Row(children: [
+                      Expanded(
+                          child: Text(meta.title,
+                              style: AppTextStyles.body.copyWith(
+                                  fontWeight: FontWeight.w600))),
+                      if (e.key == 'purpose_5')
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: AppColors.info.withOpacity(.13),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Text('COMMERCIAL',
+                              style: AppTextStyles.caption.copyWith(
+                                color: AppColors.info,
+                                fontSize: 9,
+                                fontWeight: FontWeight.w700,
+                              )),
+                        ),
+                      if (meta.required)
+                        Container(
+                          margin: const EdgeInsets.only(left: 4),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: AppColors.error.withOpacity(.10),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Text('REQUIRED',
+                              style: AppTextStyles.caption.copyWith(
+                                color: AppColors.error,
+                                fontSize: 9,
+                                fontWeight: FontWeight.w700,
+                              )),
+                        ),
+                    ]),
+                    subtitle: Text(meta.subtitle,
+                        style: AppTextStyles.caption),
+                  ),
+                ),
+              );
+            }),
+
+            const SizedBox(height: 12),
+            _infoBannerSmall(
+              'Withdrawing from clinical care (Purpose 1) will end your '
+              'ability to use this app for treatment. To withdraw it, '
+              'contact your clinic.',
+            ),
+            const SizedBox(height: 16),
+
+            Row(children: [
+              Expanded(
+                  child: OutlinedButton(
+                      onPressed: _saving
+                          ? null
+                          : () => Navigator.pop(context),
+                      child: const Text('Close'))),
+              const SizedBox(width: 10),
+              Expanded(
+                child: ElevatedButton(
+                  onPressed: _saving ? null : _saveChanges,
+                  child: _saving
+                      ? const SizedBox(
+                          height: 20,
+                          width: 20,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 2, color: Colors.white),
+                        )
+                      : const Text('Save changes'),
+                ),
+              ),
+            ]),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _infoBannerSmall(String text) => Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: AppColors.info.withOpacity(.09),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: AppColors.info.withOpacity(.25)),
+        ),
+        child: Row(children: [
+          const Icon(Icons.info_outline_rounded,
+              color: AppColors.info, size: 16),
+          const SizedBox(width: 8),
+          Expanded(
+              child: Text(text,
+                  style: AppTextStyles.caption
+                      .copyWith(color: AppColors.info, height: 1.4))),
+        ]),
+      );
+
+  Future<void> _saveChanges() async {
+    setState(() => _saving = true);
+    try {
+      final uid = FirebaseAuth.instance.currentUser?.uid;
+      if (uid == null) throw 'Not signed in';
+
+      final db = FirebaseFirestore.instance;
+      final userRef = db.collection('users').doc(uid);
+      final auditRef = userRef.collection('consent_records').doc();
+
+      final previouslyAccepted = (widget.currentConsent?[
+                      'consent_accepted_purposes'] as List?)
+                  ?.cast<String>()
+                  .toSet() ??
+              <String>{};
+
+      final added = _selected.difference(previouslyAccepted);
+      final removed = previouslyAccepted.difference(_selected);
+
+      final now = DateTime.now();
+      final batch = db.batch();
+
+      batch.set(
+        userRef,
+        {
+          'consent_accepted_purposes': _selected.toList(),
+          'consent_updated_at': FieldValue.serverTimestamp(),
+        },
+        SetOptions(merge: true),
+      );
+
+      batch.set(auditRef, {
+        'consent_version':
+            widget.currentConsent?['consent_version'] ?? '1.0',
+        'timestamp': FieldValue.serverTimestamp(),
+        'accepted_purposes': _selected.toList(),
+        'action': removed.isNotEmpty
+            ? (added.isEmpty ? 'withdrawn' : 'updated')
+            : 'granted',
+        'added_purposes': added.toList(),
+        'removed_purposes': removed.toList(),
+        'patient_name': widget.patient['fullName'] ?? '',
+        'language': 'en',
+        'minor': widget.currentConsent?['is_minor'] == true,
+        'platform': defaultTargetPlatform.name,
+        'client_timestamp': now.toUtc().toIso8601String(),
+      });
+
+      await batch.commit();
+
+      if (!mounted) return;
+      Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text('Consent preferences updated.'),
+            backgroundColor: AppColors.success),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _saving = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+            content: Text('Could not save consent: $e'),
+            backgroundColor: AppColors.error),
+      );
+    }
+  }
+}
+
+// -----------------------------------------------------------------
+// Appointment detail screen
+// -----------------------------------------------------------------
+class _AppointmentDetailScreen extends ConsumerWidget {
+  final AppointmentModel appointment;
+  const _AppointmentDetailScreen({required this.appointment});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final consultAsync =
+        ref.watch(appointmentConsultationProvider(appointment.docId));
+
+    return Scaffold(
+      backgroundColor: AppColors.background,
+      appBar: AppBar(
+        backgroundColor: AppColors.surface,
+        elevation: 0,
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back_rounded,
+              color: AppColors.textPrimary),
+          onPressed: () => Navigator.pop(context),
+        ),
+        title: Text('Visit details', style: AppTextStyles.h3),
+      ),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 28),
+          children: [
+            _header(appointment),
+            const SizedBox(height: 14),
+            _billingCard(appointment),
+            const SizedBox(height: 14),
+            consultAsync.when(
+              loading: () => const Padding(
+                padding: EdgeInsets.symmetric(vertical: 40),
+                child: Center(child: CircularProgressIndicator()),
+              ),
+              error: (e, _) => _inlineError(
+                  'Unable to load consultation details: $e'),
+                            data: (consult) {
+                if (consult == null) {
+                  return _missingConsultCard(appointment);
+                }
+                return _consultBody(context, consult);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _header(AppointmentModel a) {
+    final color = _statusColor(a.status);
+    return GlassCard(
+      borderColor: color.withOpacity(.4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: AppColors.patientAccent.withOpacity(.13),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                a.tokenNumber > 0 ? a.tokenLabel : 'Pending token',
+                style: AppTextStyles.caption
+                    .copyWith(color: AppColors.patientAccent),
+              ),
+            ),
+            const Spacer(),
+            Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+              decoration: BoxDecoration(
+                color: color.withOpacity(.13),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(a.statusLabel,
+                  style: AppTextStyles.caption.copyWith(color: color)),
+            ),
+          ]),
+          const SizedBox(height: 12),
+          Text('Dr. ${a.doctorName}', style: AppTextStyles.h2),
+          const SizedBox(height: 4),
+          Text(
+            DateFormat('EEEE, dd MMMM yyyy • hh:mm a').format(a.slot),
+            style: AppTextStyles.bodyMuted,
+          ),
+          if (a.consultStartedAt != null || a.consultEndedAt != null) ...[
+            const SizedBox(height: 8),
+            Row(children: [
+              if (a.consultStartedAt != null) ...[
+                const Icon(Icons.play_circle_outline_rounded,
+                    size: 14, color: AppColors.textMuted),
+                const SizedBox(width: 5),
+                Text(
+                  'Started ${DateFormat('hh:mm a').format(a.consultStartedAt!)}',
+                  style: AppTextStyles.caption,
+                ),
+              ],
+              if (a.consultStartedAt != null &&
+                  a.consultEndedAt != null)
+                const SizedBox(width: 14),
+              if (a.consultEndedAt != null) ...[
+                const Icon(Icons.stop_circle_outlined,
+                    size: 14, color: AppColors.textMuted),
+                const SizedBox(width: 5),
+                Text(
+                  'Ended ${DateFormat('hh:mm a').format(a.consultEndedAt!)}',
+                  style: AppTextStyles.caption,
+                ),
+              ],
+            ]),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Color _statusColor(AppointmentStatus s) {
+    switch (s) {
+      case AppointmentStatus.confirmed:
+      case AppointmentStatus.completed:
+        return AppColors.success;
+      case AppointmentStatus.awaitingConfirmation:
+        return AppColors.warning;
+      case AppointmentStatus.checkedIn:
+        return AppColors.info;
+      case AppointmentStatus.inConsult:
+        return AppColors.accent;
+      case AppointmentStatus.onHold:
+        return AppColors.textMuted;
+      case AppointmentStatus.cancelled:
+      case AppointmentStatus.declined:
+      case AppointmentStatus.noShow:
+        return AppColors.error;
+      case AppointmentStatus.booked:
+        return AppColors.primary;
+    }
+  }
+
+  Widget _billingCard(AppointmentModel a) {
+    final fee = a.consultationFees;
+    if (fee == null || fee <= 0) {
+      return _section(
+        title: 'Billing',
+        icon: Icons.receipt_long_rounded,
+        color: AppColors.success,
+        child: Text('No fee was charged for this visit.',
+            style: AppTextStyles.bodyMuted),
+      );
+    }
+    final color = switch (a.paymentStatus) {
+      PaymentStatus.paid => AppColors.success,
+      PaymentStatus.waived => AppColors.info,
+      PaymentStatus.unpaid => AppColors.warning,
+    };
+    final label = switch (a.paymentStatus) {
+      PaymentStatus.paid => 'Paid',
+      PaymentStatus.waived => 'Waived',
+      PaymentStatus.unpaid => 'Due',
+    };
+    return _section(
+      title: 'Billing',
+      icon: Icons.receipt_long_rounded,
+      color: AppColors.success,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Consultation fee',
+                      style: AppTextStyles.caption),
+                  const SizedBox(height: 3),
+                  Text(_money(fee), style: AppTextStyles.h3),
+                ],
+              ),
+            ),
+            Container(
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: color.withOpacity(.13),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(label,
+                  style: AppTextStyles.caption.copyWith(
+                      color: color, fontWeight: FontWeight.w600)),
+            ),
+          ]),
+          if (a.feesPaidAt != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Collected ${DateFormat('dd MMM yyyy • hh:mm a').format(a.feesPaidAt!)}',
+              style: AppTextStyles.caption,
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  void _orderPrescription(BuildContext context, ConsultationModel c) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => PrescriptionOrderScreen(
+          appointment: appointment,
+          consultation: c,
+        ),
+      ),
+    );
+  }
+
+    Widget _consultBody(BuildContext context, ConsultationModel c) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _section(
+          title: 'Visit summary',
+          icon: Icons.event_note_rounded,
+          color: AppColors.primary,
+          child: _summaryFacts(c),
+        ),
+        if (c.vitals.isNotEmpty) ...[
+          const SizedBox(height: 14),
+          _section(
+            title: 'Vitals',
+            icon: Icons.monitor_heart_rounded,
+            color: AppColors.info,
+            child: _vitalsGrid(c.vitals),
+          ),
+        ],
+        if (c.medications.isNotEmpty || (c.rx?.isNotEmpty ?? false)) ...[
+          const SizedBox(height: 14),
+          _section(
+            title: 'Prescription',
+            icon: Icons.medication_rounded,
+            color: AppColors.patientAccent,
+            child: _prescription(context, c),
+          ),
+        ],
+        if (c.labOrderIds.isNotEmpty) ...[
+          const SizedBox(height: 14),
+          _section(
+            title: 'Lab tests',
+            icon: Icons.science_rounded,
+            color: AppColors.info,
+            child: _labTests(context, c),
+          ),
+        ],
+        if ((c.notes?.trim().isNotEmpty ?? false)) ...[
+          const SizedBox(height: 14),
+          _section(
+            title: 'Doctor notes',
+            icon: Icons.notes_rounded,
+            color: AppColors.doctorAccent,
+            child: Text(c.notes!, style: AppTextStyles.body),
+          ),
+        ],
+        if ((c.followUpPlan?.trim().isNotEmpty ?? false)) ...[
+          const SizedBox(height: 14),
+          _section(
+            title: 'Follow-up plan',
+            icon: Icons.event_repeat_rounded,
+            color: AppColors.warning,
+            child: Text(c.followUpPlan!, style: AppTextStyles.body),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _summaryFacts(ConsultationModel c) {
+    final blocks = <(String, String?)>[
+      ('Chief complaint', c.chiefComplaint),
+      ('Symptoms', c.symptoms),
+      ('Diagnosis', _diagnosisLabel(c)),
+      ('Disposition', c.disposition),
+    ].where((b) => b.$2 != null && b.$2!.trim().isNotEmpty).toList();
+
+    if (blocks.isEmpty) {
+      return Text('No summary recorded for this visit.',
+          style: AppTextStyles.bodyMuted);
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: blocks
+          .map((b) => Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(b.$1, style: AppTextStyles.caption),
+                    const SizedBox(height: 3),
+                    Text(b.$2!, style: AppTextStyles.body),
+                  ],
+                ),
+              ))
+          .toList(),
+    );
+  }
+
+  String? _diagnosisLabel(ConsultationModel c) {
+    final text =
+        (c.diagnosisText?.trim().isNotEmpty ?? false)
+            ? c.diagnosisText!.trim()
+            : (c.diagnosis?.trim().isNotEmpty ?? false)
+                ? c.diagnosis!.trim()
+                : null;
+    final code = c.diagnosisCode?.trim();
+    if (text == null && (code == null || code.isEmpty)) return null;
+    if (text == null) return code;
+    if (code == null || code.isEmpty) return text;
+    return '$text ($code)';
+  }
+
+  Widget _vitalsGrid(Map<String, String> vitals) {
+    final entries = vitals.entries.toList()
+      ..sort((a, b) => a.key.toLowerCase().compareTo(b.key.toLowerCase()));
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: entries.map((e) {
+        return Container(
+          padding: const EdgeInsets.symmetric(
+              horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: AppColors.surface,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: AppColors.cardBorder),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(e.key, style: AppTextStyles.caption),
+              const SizedBox(height: 2),
+              Text(e.value, style: AppTextStyles.body),
+            ],
+          ),
+        );
+      }).toList(),
+    );
+  }
+
+  Widget _prescription(BuildContext context, ConsultationModel c) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (c.medications.isNotEmpty)
+          ...c.medications.map((m) {
+            final sub = [m.dose, m.frequency, m.duration]
+                .where((s) => s.trim().isNotEmpty)
+                .join(' • ');
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: 5),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Icon(Icons.medication_liquid_rounded,
+                      size: 16, color: AppColors.patientAccent),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(m.name,
+                            style: AppTextStyles.body.copyWith(
+                                fontWeight: FontWeight.w600)),
+                        if (sub.isNotEmpty) ...[
+                          const SizedBox(height: 2),
+                          Text(sub, style: AppTextStyles.caption),
+                        ],
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }),
+        if ((c.rx?.trim().isNotEmpty ?? false)) ...[
+          if (c.medications.isNotEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Divider(height: 1),
+            ),
+          Text('Additional prescription notes',
+              style: AppTextStyles.caption),
+          const SizedBox(height: 4),
+          Text(c.rx!, style: AppTextStyles.body),
+        ],
+        if (c.medications.isNotEmpty) ...[
+          const SizedBox(height: 14),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: () => _orderPrescription(context, c),
+              icon: const Icon(Icons.local_pharmacy_rounded, size: 18),
+              label: const Text('Order prescription'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.primary,
+                foregroundColor: Colors.white,
+                minimumSize: const Size.fromHeight(46),
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _labTests(BuildContext context, ConsultationModel c) {
+    final ids = c.labOrderIds;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          '${ids.length} lab test${ids.length == 1 ? '' : 's'} ordered '
+          'for this visit. Reports appear in the Lab reports tab.',
+          style: AppTextStyles.bodyMuted,
+        ),
+        const SizedBox(height: 8),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            icon: const Icon(Icons.science_outlined, size: 16),
+            label: const Text('Open lab reports'),
+            onPressed: () => Navigator.pop(context),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: AppColors.info,
+              side: const BorderSide(color: AppColors.info),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _missingConsultCard(AppointmentModel a) {
+    final label = a.status == AppointmentStatus.completed
+        ? 'The doctor has not finalized the notes for this visit yet.'
+        : 'Clinical details will appear here after the consultation.';
+    return GlassCard(
+      child: Row(children: [
+        const Icon(Icons.info_outline_rounded,
+            color: AppColors.info, size: 20),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Text(label,
+              style: AppTextStyles.body.copyWith(
+                  color: AppColors.textSecondary)),
+        ),
+      ]),
+    );
+  }
+
+  Widget _section({
+    required String title,
+    required IconData icon,
+    required Color color,
+    required Widget child,
+  }) {
+    return GlassCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Icon(icon, size: 18, color: color),
+            const SizedBox(width: 9),
+            Text(title, style: AppTextStyles.h3),
+          ]),
+          const SizedBox(height: 12),
+          child,
+        ],
+      ),
+    );
+  }
+
+  Widget _inlineError(String message) => Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+            color: AppColors.error.withOpacity(.08),
+            borderRadius: BorderRadius.circular(12)),
+        child:
+            Text(message, style: const TextStyle(color: AppColors.error)),
+      );
 }
 
 // -----------------------------------------------------------------

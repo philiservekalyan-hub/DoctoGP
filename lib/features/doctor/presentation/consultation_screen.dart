@@ -185,7 +185,6 @@ class _ConsultBodyState extends ConsumerState<_ConsultBody> {
   final _followUpCtrl = TextEditingController();
   final _meds = <_MedRow>[];
 
-  // ── Phase 1 additions ──
   Icd10Code? _selectedIcd;
   Disposition? _selectedDisposition;
 
@@ -207,6 +206,19 @@ class _ConsultBodyState extends ConsumerState<_ConsultBody> {
     super.dispose();
   }
 
+  // ── Unsaved-state detection (used by back-guard & Cancel) ──
+  bool get _hasAnyInput {
+    bool anyText(TextEditingController c) => c.text.trim().isNotEmpty;
+    return anyText(_symptomsCtrl) ||
+        anyText(_diagnosisCtrl) ||
+        anyText(_notesCtrl) ||
+        anyText(_followUpCtrl) ||
+        anyText(_rxController) ||
+        _meds.isNotEmpty ||
+        _selectedIcd != null ||
+        _selectedDisposition != null;
+  }
+
   void _hydrate(ConsultationModel? c) {
     if (_initialized) return;
     if (c != null) {
@@ -216,7 +228,6 @@ class _ConsultBodyState extends ConsumerState<_ConsultBody> {
       _notesCtrl.text = c.notes ?? '';
       _followUpCtrl.text = c.followUpPlan ?? '';
 
-      // ── Hydrate ICD-10 from the draft ──
       if ((c.diagnosisCode ?? '').isNotEmpty &&
           (c.diagnosisText ?? '').isNotEmpty) {
         _selectedIcd = Icd10Code(
@@ -225,7 +236,6 @@ class _ConsultBodyState extends ConsumerState<_ConsultBody> {
         );
       }
 
-      // ── Hydrate disposition ──
       _selectedDisposition = dispositionFromString(c.disposition);
 
       for (final m in c.medications) {
@@ -434,6 +444,132 @@ class _ConsultBodyState extends ConsumerState<_ConsultBody> {
     }
   }
 
+  // ── Cancel: confirm → revert appointment → pop ──
+  Future<void> _cancelConsult() async {
+  if (_saving) return;
+
+  final choice = await showDialog<_CancelChoice>(
+    context: context,
+    builder: (dctx) => AlertDialog(
+      backgroundColor: AppColors.surface,
+      title: Text('End this consultation?', style: AppTextStyles.h3),
+      content: const Text(
+        'Choose what happens to this appointment:\n\n'
+        '• Back to queue — the patient returns to "Today\'s Patients" '
+        'and you can resume this consult later. The draft is kept.\n\n'
+        '• Cancel consultation — the visit is abandoned and the '
+        'appointment is marked cancelled. The patient will NOT return '
+        'to the queue.',
+        style: TextStyle(color: AppColors.textSecondary, height: 1.4),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dctx, _CancelChoice.keepEditing),
+          child: const Text('Keep editing'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.pop(dctx, _CancelChoice.backToQueue),
+          child: const Text('Back to queue',
+              style: TextStyle(color: AppColors.warning)),
+        ),
+        ElevatedButton(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: AppColors.error,
+            foregroundColor: Colors.white,
+          ),
+          onPressed: () => Navigator.pop(dctx, _CancelChoice.cancelConsult),
+          child: const Text('Cancel consultation'),
+        ),
+      ],
+    ),
+  );
+
+  if (choice == null || choice == _CancelChoice.keepEditing) return;
+
+  try {
+    switch (choice) {
+      case _CancelChoice.backToQueue:
+        await ref
+            .read(appointmentServiceProvider)
+            .revertToCheckedIn(widget.appointment.docId);
+        break;
+      case _CancelChoice.cancelConsult:
+        await ref
+            .read(appointmentServiceProvider)
+            .cancelByStaff(
+              widget.appointment.docId,
+              reason: 'consult_cancelled',
+            );
+        break;
+      case _CancelChoice.keepEditing:
+        return;
+    }
+  } catch (e) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('Could not update appointment: $e'),
+      backgroundColor: AppColors.error,
+    ));
+    return;
+  }
+
+  if (!mounted) return;
+  ref.read(selectedAppointmentProvider.notifier).state = null;
+  ref.read(doctorTabProvider.notifier).state = 0;
+  Navigator.of(context).maybePop();
+
+  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+    content: Text(
+      choice == _CancelChoice.backToQueue
+          ? 'Returned to queue — patient can be resumed later'
+          : 'Consultation cancelled',
+    ),
+    backgroundColor:
+        choice == _CancelChoice.backToQueue
+            ? AppColors.warning
+            : AppColors.error,
+  ));
+}
+
+  // ── Section clear ──
+  Future<void> _clearSection({
+    required String label,
+    required bool hasContent,
+    required VoidCallback onClear,
+  }) async {
+    if (!hasContent) {
+      onClear();
+      return;
+    }
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Text('Clear $label?', style: AppTextStyles.h3),
+        content: Text(
+          'This will remove what you entered in $label. '
+          'Other sections are not affected.',
+          style: const TextStyle(color: AppColors.textSecondary),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.error,
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () => Navigator.pop(dctx, true),
+            child: Text('Clear $label'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) onClear();
+  }
+
   @override
   Widget build(BuildContext context) {
     final appt = widget.appointment;
@@ -450,329 +586,441 @@ class _ConsultBodyState extends ConsumerState<_ConsultBody> {
         ? appt.patientName[0].toUpperCase()
         : '?';
 
-    return Scaffold(
-      backgroundColor: AppColors.background,
-      appBar: AppBar(
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(appt.patientName, style: AppTextStyles.h3),
-            Text(
-              '${appt.patientId} • ${appt.tokenLabel} • '
-              '${appt.slotPeriodLabel}',
-              style: AppTextStyles.caption,
-            ),
-          ],
-        ),
-        actions: [
-          if (!isReadOnly)
-            TextButton.icon(
-              onPressed: _saving ? null : _saveDraft,
-              icon: const Icon(Icons.save_outlined,
-                  size: 18, color: AppColors.info),
-              label: const Text('Save',
-                  style: TextStyle(color: AppColors.info)),
-            ),
-        ],
-      ),
-      body: RefreshIndicator(
-        color: AppColors.primary,
-        onRefresh: () async {
-          ref.invalidate(patientHistoryProvider(appt.patientDocId));
-          ref.invalidate(consultationDraftProvider(appt.docId));
-          ref.invalidate(appointmentVitalsProvider(appt.docId));
-        },
-        child: SingleChildScrollView(
-          physics: const AlwaysScrollableScrollPhysics(),
-          padding: const EdgeInsets.all(20),
-          child: Column(
+    return PopScope(
+      canPop: !(!isReadOnly && _hasAnyInput),
+      onPopInvokedWithResult: (didPop, _) async {
+        if (didPop) return;
+        await _cancelConsult();
+      },
+      child: Scaffold(
+        backgroundColor: AppColors.background,
+        appBar: AppBar(
+          leading: (!isReadOnly)
+              ? IconButton(
+                  tooltip: 'Cancel consultation',
+                  icon: const Icon(Icons.close_rounded,
+                      color: AppColors.error),
+                  onPressed: _cancelConsult,
+                )
+              : null,
+          title: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // -------- Patient header --------
-              GlassCard(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(children: [
-                      CircleAvatar(
-                        backgroundColor:
-                            AppColors.doctorAccent.withOpacity(0.2),
-                        child: Text(initial,
-                            style: const TextStyle(
-                                color: AppColors.doctorAccent)),
-                      ),
-                      const SizedBox(width: 14),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment:
-                              CrossAxisAlignment.start,
-                          children: [
-                            Text(appt.patientName,
-                                style: AppTextStyles.h3),
-                            const SizedBox(height: 2),
-                            Text(
-                              [
-                                appt.patientId,
-                                appt.tokenNumber > 0
-                                    ? appt.tokenLabel
-                                    : null,
-                                appt.slotPeriodLabel,
-                              ]
-                                  .whereType<String>()
-                                  .where((s) => s.isNotEmpty)
-                                  .join(' • '),
-                              style: AppTextStyles.caption,
-                            ),
-                          ],
-                        ),
-                      ),
-                      if (appt.consultationFees != null)
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 8, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: (appt.paymentStatus ==
-                                        PaymentStatus.paid
-                                    ? AppColors.success
-                                    : AppColors.warning)
-                                .withOpacity(.12),
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          child: Text(
-                            '₹${appt.consultationFees!.toStringAsFixed(0)} · '
-                            '${appt.paymentStatusLabel}',
-                            style: AppTextStyles.caption.copyWith(
-                              color: appt.paymentStatus ==
-                                      PaymentStatus.paid
-                                  ? AppColors.success
-                                  : AppColors.warning,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ),
-                    ]),
-                    const SizedBox(height: 16),
-                    const Divider(),
-                    const SizedBox(height: 10),
-                    Text('Chief Complaint', style: AppTextStyles.label),
-                    const SizedBox(height: 6),
-                    Text(
-                      appt.chiefComplaint?.trim().isNotEmpty == true
-                          ? appt.chiefComplaint!
-                          : 'Not recorded',
-                      style:
-                          appt.chiefComplaint?.trim().isNotEmpty == true
-                              ? AppTextStyles.body
-                              : AppTextStyles.bodyMuted,
-                    ),
-                  ],
-                ),
+              Text(appt.patientName, style: AppTextStyles.h3),
+              Text(
+                '${appt.patientId} • ${appt.tokenLabel} • '
+                '${appt.slotPeriodLabel}',
+                style: AppTextStyles.caption,
               ),
-
-              const SizedBox(height: 24),
-
-              // -------- Vitals --------
-              const SectionHeader(title: 'Vitals'),
-              _VitalsSection(
-                appointment: appt,
-                readOnly: isReadOnly,
-              ),
-
-              const SizedBox(height: 24),
-
-              // -------- Clinical fields --------
-              _field('Symptoms', _symptomsCtrl,
-                  maxLines: 2, readOnly: isReadOnly),
-
-              // ── ICD-10 picker ──
-              Icd10SearchField(
-                initial: _selectedIcd,
-                readOnly: isReadOnly,
-                onSelected: (code) =>
-                    setState(() => _selectedIcd = code),
-              ),
-              const SizedBox(height: 12),
-
-              _field('Clinical impression / notes', _diagnosisCtrl,
-                  maxLines: 2, readOnly: isReadOnly),
-              _field('Consultation notes', _notesCtrl,
-                  maxLines: 4, readOnly: isReadOnly),
-
-              const SizedBox(height: 8),
-
-              // ── Disposition picker ──
-              _dispositionSelector(isReadOnly),
-              const SizedBox(height: 16),
-
-              // -------- Prescription --------
-              const SectionHeader(title: 'Prescription'),
-              const SizedBox(height: 8),
-              GlassCard(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(children: [
-                      Expanded(
-                          child: Text('Write / dictate Rx',
-                              style: AppTextStyles.label)),
-                      IconButton(
-                        onPressed: isReadOnly ? null : _toggleVoice,
-                        icon: Icon(
-                          _listening
-                              ? Icons.mic_rounded
-                              : Icons.mic_none_rounded,
-                          color: isReadOnly
-                              ? AppColors.textMuted
-                              : (_listening
-                                  ? AppColors.error
-                                  : AppColors.primary),
-                        ),
-                      ),
-                    ]),
-                    const SizedBox(height: 6),
-                    TextField(
-                      controller: _rxController,
-                      maxLines: 5,
-                      readOnly: isReadOnly,
-                      style: const TextStyle(
-                          color: AppColors.textPrimary),
-                      decoration: const InputDecoration(
-                        hintText:
-                            'e.g. Paracetamol 500mg — 1 tab TID x 3 days',
-                      ),
-                    ),
-                    const SizedBox(height: 14),
-                    const Text(
-                      'Note: Doctor must review all dictated text '
-                      'before issuing.',
-                      style: TextStyle(
-                          color: AppColors.textMuted, fontSize: 11),
-                    ),
-                  ],
-                ),
-              ),
-
-              const SizedBox(height: 16),
-
-              // -------- Structured medications --------
-              Row(children: [
-                const Expanded(
-                    child: SectionHeader(title: 'Medications')),
-                if (!isReadOnly)
-                  TextButton.icon(
-                    onPressed: () =>
-                        setState(() => _meds.add(_MedRow())),
-                    icon: const Icon(Icons.add_rounded,
-                        size: 16, color: AppColors.info),
-                    label: const Text('Add',
-                        style: TextStyle(color: AppColors.info)),
-                  ),
-              ]),
-              const SizedBox(height: 6),
-              if (_meds.isEmpty)
-                GlassCard(
-                  child: Text('No structured medications added.',
-                      style: AppTextStyles.bodyMuted),
-                )
-              else
-                for (final m in _meds)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 10),
-                    child: _MedicationCard(
-                      row: m,
-                      readOnly: isReadOnly,
-                      onRemove: () => setState(() {
-                        m.dispose();
-                        _meds.remove(m);
-                      }),
-                    ),
-                  ),
-
-              const SizedBox(height: 16),
-
-              _field('Follow-up plan', _followUpCtrl,
-                  maxLines: 2, readOnly: isReadOnly),
-
-              const SizedBox(height: 20),
-
-              // -------- Lab tests for this visit --------
-              Row(children: [
-                const Expanded(
-                    child:
-                        SectionHeader(title: 'Lab Tests — this visit')),
-                TextButton.icon(
-                  onPressed: (isReadOnly || _openingLabOrder)
-                      ? null
-                      : _orderTest,
-                  icon: const Icon(Icons.add_rounded, size: 16),
-                  label: const Text('Order'),
-                  style: TextButton.styleFrom(
-                    foregroundColor: AppColors.info,
-                    textStyle: const TextStyle(
-                        fontSize: 12, fontWeight: FontWeight.w600),
-                  ),
-                ),
-              ]),
-              const SizedBox(height: 6),
-              _thisVisitLabs(historyAsync, appt),
-
-              const SizedBox(height: 24),
-              const SectionHeader(title: 'Past consultations'),
-              const SizedBox(height: 8),
-              _pastConsults(historyAsync, appt),
-
-              const SizedBox(height: 28),
-
-              // -------- Complete button --------
-              if (!isReadOnly)
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton.icon(
-                    onPressed: _saving ? null : _completeConsult,
-                    icon: _saving
-                        ? const SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: AppColors.background),
-                          )
-                        : const Icon(
-                            Icons.check_circle_outline_rounded),
-                    label: Text(_saving
-                        ? 'Completing…'
-                        : 'Complete Consultation'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: AppColors.doctorAccent,
-                      foregroundColor: AppColors.background,
-                      padding:
-                          const EdgeInsets.symmetric(vertical: 18),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(14),
-                      ),
-                    ),
-                  ),
-                )
-              else
-                GlassCard(
-                  borderColor:
-                      AppColors.success.withOpacity(.35),
-                  child: Row(children: const [
-                    Icon(Icons.check_circle_rounded,
-                        color: AppColors.success),
-                    SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                          'Consultation already completed',
-                          style:
-                              TextStyle(color: AppColors.success)),
-                    ),
-                  ]),
-                ),
-              const SizedBox(height: 40),
             ],
           ),
+          actions: [
+            if (!isReadOnly)
+              TextButton.icon(
+                onPressed: _saving ? null : _saveDraft,
+                icon: const Icon(Icons.save_outlined,
+                    size: 18, color: AppColors.info),
+                label: const Text('Save',
+                    style: TextStyle(color: AppColors.info)),
+              ),
+          ],
         ),
+        body: RefreshIndicator(
+          color: AppColors.primary,
+          onRefresh: () async {
+            ref.invalidate(patientHistoryProvider(appt.patientDocId));
+            ref.invalidate(consultationDraftProvider(appt.docId));
+            ref.invalidate(appointmentVitalsProvider(appt.docId));
+          },
+          child: SingleChildScrollView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // -------- Patient header --------
+                GlassCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(children: [
+                        CircleAvatar(
+                          backgroundColor:
+                              AppColors.doctorAccent.withOpacity(0.2),
+                          child: Text(initial,
+                              style: const TextStyle(
+                                  color: AppColors.doctorAccent)),
+                        ),
+                        const SizedBox(width: 14),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment:
+                                CrossAxisAlignment.start,
+                            children: [
+                              Text(appt.patientName,
+                                  style: AppTextStyles.h3),
+                              const SizedBox(height: 2),
+                              Text(
+                                [
+                                  appt.patientId,
+                                  appt.tokenNumber > 0
+                                      ? appt.tokenLabel
+                                      : null,
+                                  appt.slotPeriodLabel,
+                                ]
+                                    .whereType<String>()
+                                    .where((s) => s.isNotEmpty)
+                                    .join(' • '),
+                                style: AppTextStyles.caption,
+                              ),
+                            ],
+                          ),
+                        ),
+                        if (appt.consultationFees != null)
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: (appt.paymentStatus ==
+                                          PaymentStatus.paid
+                                      ? AppColors.success
+                                      : AppColors.warning)
+                                  .withOpacity(.12),
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: Text(
+                              '₹${appt.consultationFees!.toStringAsFixed(0)} · '
+                              '${appt.paymentStatusLabel}',
+                              style: AppTextStyles.caption.copyWith(
+                                color: appt.paymentStatus ==
+                                        PaymentStatus.paid
+                                    ? AppColors.success
+                                    : AppColors.warning,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                      ]),
+                      const SizedBox(height: 16),
+                      const Divider(),
+                      const SizedBox(height: 10),
+                      Text('Chief Complaint', style: AppTextStyles.label),
+                      const SizedBox(height: 6),
+                      Text(
+                        appt.chiefComplaint?.trim().isNotEmpty == true
+                            ? appt.chiefComplaint!
+                            : 'Not recorded',
+                        style:
+                            appt.chiefComplaint?.trim().isNotEmpty == true
+                                ? AppTextStyles.body
+                                : AppTextStyles.bodyMuted,
+                      ),
+                    ],
+                  ),
+                ),
+
+                const SizedBox(height: 24),
+
+                // -------- Vitals (read-only by design, no Clear needed) --------
+                const SectionHeader(title: 'Vitals'),
+                _VitalsSection(
+                  appointment: appt,
+                  readOnly: isReadOnly,
+                ),
+
+                const SizedBox(height: 24),
+
+                // -------- Symptoms (with Clear) --------
+                _SectionHeader(
+                  title: 'Symptoms',
+                  action: (!isReadOnly && _symptomsCtrl.text.trim().isNotEmpty)
+                      ? _clearAction(
+                          label: 'symptoms',
+                          onClear: () =>
+                              setState(() => _symptomsCtrl.clear()),
+                        )
+                      : null,
+                ),
+                _field('Symptoms', _symptomsCtrl,
+                    maxLines: 2, readOnly: isReadOnly),
+
+                // -------- ICD-10 + Clinical impression (Clear both) --------
+                _SectionHeader(
+                  title: 'Diagnosis',
+                  action: (!isReadOnly &&
+                          (_selectedIcd != null ||
+                              _diagnosisCtrl.text.trim().isNotEmpty))
+                      ? _clearAction(
+                          label: 'diagnosis',
+                          onClear: () => setState(() {
+                            _diagnosisCtrl.clear();
+                            _selectedIcd = null;
+                          }),
+                        )
+                      : null,
+                ),
+                Icd10SearchField(
+                  initial: _selectedIcd,
+                  readOnly: isReadOnly,
+                  onSelected: (code) =>
+                      setState(() => _selectedIcd = code),
+                ),
+                const SizedBox(height: 12),
+                _field('Clinical impression / notes', _diagnosisCtrl,
+                    maxLines: 2, readOnly: isReadOnly),
+
+                // -------- Consultation notes (Clear) --------
+                _SectionHeader(
+                  title: 'Consultation notes',
+                  action: (!isReadOnly && _notesCtrl.text.trim().isNotEmpty)
+                      ? _clearAction(
+                          label: 'notes',
+                          onClear: () =>
+                              setState(() => _notesCtrl.clear()),
+                        )
+                      : null,
+                ),
+                _field('Consultation notes', _notesCtrl,
+                    maxLines: 4, readOnly: isReadOnly),
+
+                const SizedBox(height: 8),
+
+                // -------- Disposition (Clear) --------
+                _SectionHeader(
+                  title: 'Disposition',
+                  action: (!isReadOnly && _selectedDisposition != null)
+                      ? _clearAction(
+                          label: 'disposition',
+                          onClear: () => setState(
+                              () => _selectedDisposition = null),
+                        )
+                      : null,
+                ),
+                _dispositionSelector(isReadOnly),
+                const SizedBox(height: 16),
+
+                // -------- Prescription + Medications (Clear) --------
+                _SectionHeader(
+                  title: 'Prescription',
+                  action: (!isReadOnly &&
+                          (_rxController.text.trim().isNotEmpty ||
+                              _meds.isNotEmpty))
+                      ? _clearAction(
+                          label: 'prescription',
+                          onClear: () => setState(() {
+                            _rxController.clear();
+                            for (final m in _meds) {
+                              m.dispose();
+                            }
+                            _meds.clear();
+                          }),
+                        )
+                      : null,
+                ),
+                const SizedBox(height: 8),
+                GlassCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(children: [
+                        Expanded(
+                            child: Text('Write / dictate Rx',
+                                style: AppTextStyles.label)),
+                        IconButton(
+                          onPressed: isReadOnly ? null : _toggleVoice,
+                          icon: Icon(
+                            _listening
+                                ? Icons.mic_rounded
+                                : Icons.mic_none_rounded,
+                            color: isReadOnly
+                                ? AppColors.textMuted
+                                : (_listening
+                                    ? AppColors.error
+                                    : AppColors.primary),
+                          ),
+                        ),
+                      ]),
+                      const SizedBox(height: 6),
+                      TextField(
+                        controller: _rxController,
+                        maxLines: 5,
+                        readOnly: isReadOnly,
+                        style: const TextStyle(
+                            color: AppColors.textPrimary),
+                        decoration: const InputDecoration(
+                          hintText:
+                              'e.g. Paracetamol 500mg — 1 tab TID x 3 days',
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      const Text(
+                        'Note: Doctor must review all dictated text '
+                        'before issuing.',
+                        style: TextStyle(
+                            color: AppColors.textMuted, fontSize: 11),
+                      ),
+                    ],
+                  ),
+                ),
+
+                const SizedBox(height: 16),
+
+                Row(children: [
+                  const Expanded(
+                      child: SectionHeader(title: 'Medications')),
+                  if (!isReadOnly)
+                    TextButton.icon(
+                      onPressed: () =>
+                          setState(() => _meds.add(_MedRow())),
+                      icon: const Icon(Icons.add_rounded,
+                          size: 16, color: AppColors.info),
+                      label: const Text('Add',
+                          style: TextStyle(color: AppColors.info)),
+                    ),
+                ]),
+                const SizedBox(height: 6),
+                if (_meds.isEmpty)
+                  GlassCard(
+                    child: Text('No structured medications added.',
+                        style: AppTextStyles.bodyMuted),
+                  )
+                else
+                  for (final m in _meds)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: _MedicationCard(
+                        row: m,
+                        readOnly: isReadOnly,
+                        onRemove: () => setState(() {
+                          m.dispose();
+                          _meds.remove(m);
+                        }),
+                      ),
+                    ),
+
+                const SizedBox(height: 16),
+
+                // -------- Follow-up (Clear) --------
+                _SectionHeader(
+                  title: 'Follow-up plan',
+                  action: (!isReadOnly &&
+                          _followUpCtrl.text.trim().isNotEmpty)
+                      ? _clearAction(
+                          label: 'follow-up plan',
+                          onClear: () =>
+                              setState(() => _followUpCtrl.clear()),
+                        )
+                      : null,
+                ),
+                _field('Follow-up plan', _followUpCtrl,
+                    maxLines: 2, readOnly: isReadOnly),
+
+                const SizedBox(height: 20),
+
+                // -------- Lab tests for this visit --------
+                Row(children: [
+                  const Expanded(
+                      child:
+                          SectionHeader(title: 'Lab Tests — this visit')),
+                  TextButton.icon(
+                    onPressed: (isReadOnly || _openingLabOrder)
+                        ? null
+                        : _orderTest,
+                    icon: const Icon(Icons.add_rounded, size: 16),
+                    label: const Text('Order'),
+                    style: TextButton.styleFrom(
+                      foregroundColor: AppColors.info,
+                      textStyle: const TextStyle(
+                          fontSize: 12, fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ]),
+                const SizedBox(height: 6),
+                _thisVisitLabs(historyAsync, appt),
+
+                const SizedBox(height: 24),
+                const SectionHeader(title: 'Past consultations'),
+                const SizedBox(height: 8),
+                _pastConsults(historyAsync, appt),
+
+                const SizedBox(height: 28),
+
+                // -------- Complete button --------
+                if (!isReadOnly)
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton.icon(
+                      onPressed: _saving ? null : _completeConsult,
+                      icon: _saving
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: AppColors.background),
+                            )
+                          : const Icon(
+                              Icons.check_circle_outline_rounded),
+                      label: Text(_saving
+                          ? 'Completing…'
+                          : 'Complete Consultation'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: AppColors.doctorAccent,
+                        foregroundColor: AppColors.background,
+                        padding:
+                            const EdgeInsets.symmetric(vertical: 18),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                    ),
+                  )
+                else
+                  GlassCard(
+                    borderColor:
+                        AppColors.success.withOpacity(.35),
+                    child: Row(children: const [
+                      Icon(Icons.check_circle_rounded,
+                          color: AppColors.success),
+                      SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                            'Consultation already completed',
+                            style:
+                                TextStyle(color: AppColors.success)),
+                      ),
+                    ]),
+                  ),
+                const SizedBox(height: 40),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── Small text "Clear" action ──
+  Widget _clearAction({
+    required String label,
+    required VoidCallback onClear,
+  }) {
+    return TextButton.icon(
+      onPressed: () => _clearSection(
+        label: label,
+        hasContent: true,
+        onClear: onClear,
+      ),
+      icon: const Icon(Icons.refresh_rounded,
+          size: 16, color: AppColors.error),
+      label: Text(
+        'Clear',
+        style: TextStyle(color: AppColors.error, fontSize: 12),
+      ),
+      style: TextButton.styleFrom(
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        minimumSize: const Size(0, 30),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
       ),
     );
   }
@@ -781,8 +1029,6 @@ class _ConsultBodyState extends ConsumerState<_ConsultBody> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('Disposition', style: AppTextStyles.caption),
-        const SizedBox(height: 6),
         GlassCard(
           child: Column(
             children: [
@@ -819,8 +1065,6 @@ class _ConsultBodyState extends ConsumerState<_ConsultBody> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(label, style: AppTextStyles.caption),
-          const SizedBox(height: 6),
           GlassCard(
             child: TextField(
               controller: c,
@@ -831,6 +1075,7 @@ class _ConsultBodyState extends ConsumerState<_ConsultBody> {
                 border: InputBorder.none,
                 isCollapsed: true,
               ),
+              onChanged: (_) => setState(() {}),
             ),
           ),
         ],
@@ -849,10 +1094,10 @@ class _ConsultBodyState extends ConsumerState<_ConsultBody> {
           style: const TextStyle(color: AppColors.error)),
       data: (h) {
         final thisVisit = h.labOrders
-    .where((o) =>
-        o.appointmentId == a.docId &&
-        !(o.status == LabOrderStatus.ready && !o.released))
-    .toList();
+            .where((o) =>
+                o.appointmentId == a.docId &&
+                !(o.status == LabOrderStatus.ready && !o.released))
+            .toList();
         if (thisVisit.isEmpty) {
           return GlassCard(
             child: Row(children: [
@@ -909,6 +1154,32 @@ class _ConsultBodyState extends ConsumerState<_ConsultBody> {
             ),
         ]);
       },
+    );
+  }
+}
+
+// -----------------------------------------------------------------
+// Section header with trailing action (used for per-section Clear)
+// -----------------------------------------------------------------
+class _SectionHeader extends StatelessWidget {
+  final String title;
+  final Widget? action;
+  const _SectionHeader({required this.title, this.action});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8, top: 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(title,
+                style: AppTextStyles.body
+                    .copyWith(fontWeight: FontWeight.w600)),
+          ),
+          if (action != null) action!,
+        ],
+      ),
     );
   }
 }
@@ -984,7 +1255,7 @@ class _LabOrderRow extends StatelessWidget {
 }
 
 // -----------------------------------------------------------------
-// Past consult card — now shows ICD-10 code + disposition
+// Past consult card
 // -----------------------------------------------------------------
 class _PastConsultCard extends StatelessWidget {
   final ConsultationModel c;
@@ -1096,7 +1367,7 @@ class _PastConsultCard extends StatelessWidget {
 }
 
 // -----------------------------------------------------------------
-// Vitals section — unchanged
+// Vitals section
 // -----------------------------------------------------------------
 class _VitalBox extends StatelessWidget {
   final String label;
@@ -1272,7 +1543,7 @@ class _VitalsSection extends ConsumerWidget {
 }
 
 // -----------------------------------------------------------------
-// Doctor-side vitals capture — unchanged
+// Doctor-side vitals capture
 // -----------------------------------------------------------------
 class _DoctorVitalsCaptureScreen extends ConsumerStatefulWidget {
   final AppointmentModel appointment;
@@ -1448,7 +1719,7 @@ class _DoctorVitalsCaptureScreenState
 }
 
 // -----------------------------------------------------------------
-// Fees dialog — unchanged
+// Fees dialog
 // -----------------------------------------------------------------
 class _FeesDialog extends StatefulWidget {
   const _FeesDialog();
@@ -1520,7 +1791,7 @@ class _FeesDialogState extends State<_FeesDialog> {
 }
 
 // -----------------------------------------------------------------
-// Medication card — unchanged
+// Medication card
 // -----------------------------------------------------------------
 class _MedicationCard extends StatelessWidget {
   final _MedRow row;
@@ -1645,7 +1916,7 @@ class _MedicationCard extends StatelessWidget {
     );
   }
 }
-
+enum _CancelChoice { keepEditing, backToQueue, cancelConsult }
 // -----------------------------------------------------------------
 // Med-row controllers
 // -----------------------------------------------------------------
